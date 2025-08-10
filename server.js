@@ -60,10 +60,10 @@ app.post('/declarations', async (req, res) => {
     // Handle new exporter
     if (!exporter?.id && exporter?.name && exporter?.number) {
       const newExporter = { id: uuidv4(), name: exporter.name, tin: exporter.number };
-      db.data.users.push(newExporter);
+      db.data.exporters.push(newExporter);
       newDeclaration.exporter.id = newExporter.id;
     } else if (exporter?.id && exporter?.number) {
-      const user = db.data.users.find(u => u.id === exporter.id);
+      const user = db.data.exporters.find(u => u.id === exporter.id);
       if (user) user.tin = exporter.number;
     }
 
@@ -104,10 +104,10 @@ app.put('/declarations/:id', async (req, res) => {
     // Handle new exporter
     if (!exporter?.id && exporter?.name && exporter?.number) {
       const newExporter = { id: uuidv4(), name: exporter.name, tin: exporter.number };
-      db.data.users.push(newExporter);
+      db.data.exporters.push(newExporter);
       updatedData.exporter.id = newExporter.id;
     } else if (exporter?.id && exporter?.number) {
-      const user = db.data.users.find(u => u.id === exporter.id);
+      const user = db.data.exporters.find(u => u.id === exporter.id);
       if (user) user.tin = exporter.number;
     }
 
@@ -212,12 +212,24 @@ app.get('/users', async (req, res) => {
 });
 
 
+// GET all exporters
+app.get('/exporters', async (req, res) => {
+  try {
+    await db.read();
+    const exporters = db.data.exporters || [];
+    res.status(200).json(exporters);
+  } catch (error) {
+    console.error('Failed to fetch exporters:', error);
+    res.status(500).json({ error: 'Failed to fetch exporters.' });
+  }
+});
+
+
 // ----------------------------------------------------------------------
 // XML Generation (reading from DB)
 // ----------------------------------------------------------------------
 app.post('/generate-xml', async (req, res) => {
-
-  const data = req.body; // Master bill data
+  const masterBill = req.body; // Expecting masterBill object
   try {
     await db.read();
     const { declarations } = db.data;
@@ -226,7 +238,7 @@ app.post('/generate-xml', async (req, res) => {
       return res.status(400).json({ error: 'No declarations in DB.' });
     }
 
-    const structuredJs = structureDataForXml(declarations);
+    const structuredJs = structureDataForXml(declarations, masterBill);
     const xmlData = js2xml(structuredJs, { compact: true, spaces: 4 });
 
     res.header('Content-Type', 'application/xml');
@@ -234,31 +246,55 @@ app.post('/generate-xml', async (req, res) => {
     res.status(200).send(xmlData);
 
   } catch (error) {
+    console.error('XML generation error:', error);
     res.status(500).json({ error: 'An internal server error occurred.' });
   }
 });
 
-// ----------------------------------------------------------------------
-// XML Helper Function (No changes needed here)
-// ----------------------------------------------------------------------
-function structureDataForXml(consolidatedItems) {
+function structureDataForXml(consolidatedItems, masterBill) {
+  const mode = masterBill.consignment?.transportMode;
   const sadEntryObject = {
     _declaration: { _attributes: { version: '1.0', encoding: 'UTF-8' } },
     SADEntry: {
       Date: { _text: new Date().toISOString().split('T')[0] },
       Regime: { _text: 'IM1' },
-      Importer: { Number: { _text: '20005264' } },
-      Exporter: { Number: { _text: '21667417' } },
+      Importer: { Number: { _text: "20005264" } },
+      Exporter: { Number: { _text: masterBill.exporter?.number || '' } },
       Finance: {},
       Consignment: {
-        DepartureDate: { _text: '2025-05-15' },
-        ArrivalDate: { _text: '2025-06-07' },
-        ExportCountry: { _text: 'USA' },
-        ImportCountry: { _text: 'USA' },
-        ShippingPort: { _text: 'USKLS' },
-        DischargePort: { _text: 'KYGEC' },
-        TransportMode: { _text: 'SEA' },
+        DepartureDate: { _text: masterBill.consignment?.departureDate || '' },
+        ArrivalDate: { _text: masterBill.consignment?.arrivalDate || '' },
+        ExportCountry: { _text: "USA" },
+        ImportCountry: { _text: "USA" },
+        ShippingPort: { _text: masterBill.consignment?.shippingPort || '' },
+        DischargePort: { _text: mode == "SEA" ? 'KYGEC' : "KYGCM"},
+        TransportMode: { _text: mode || '' },
       },
+      Shipment: {
+        VesselCode: { _text: masterBill.shipment?.vesselCode || '' },
+        VoyageNo: { _text: masterBill.shipment?.voyageNo || '' },
+        ShippingAgent: { _text: masterBill.shipment?.shippingAgent || '' },
+        BillNumber: { _text: masterBill.shipment?.billNumber || '' },
+        BillType: { _text: "CONSOLIDATED" },
+      },
+      Packages: {
+        PkgCount: { _text: masterBill.packages?.pkgCount || '' },
+        PkgType: { _text: masterBill.packages.pkgType },
+        GrossWt: { _text: masterBill.packages?.grossWt || '' },
+        GrossWtUnit: { _text: 'LB' },
+        GrossVol: { _text: masterBill.packages?.grossVol || '' },
+        GrossVolUnit: { _text: 'CF' },
+        Contents: { _text: masterBill.packages?.contents || '' },
+        CategoryOfGoods: { _text: "1" },
+      },
+      Valuation: {
+        Currency: { _text: 'USD' },
+        NetCost: { _text: masterBill.valuation?.netCost || '' },
+        NetInsurance: { _text: masterBill.valuation?.netInsurance || '' },
+        NetFreight: { _text: masterBill.valuation?.netFreight || '' },
+        TermsOfDelivery: { _text: "FOB" },
+      },
+      MoneyDeclaredFlag: { _text: "N" },
       ConsolidatedShipment: {
         ConsolidatedItem: consolidatedItems.map(item => ({
           Importer: { Number: { _text: item.importer.number } },
@@ -273,7 +309,7 @@ function structureDataForXml(consolidatedItems) {
             GrossVol: { _text: item.packages.grossVol },
             GrossVolUnit: { _text: "CF" },
             Contents: { _text: item.packages.contents },
-            CategoryOfGoods: { Number: 1 },
+            CategoryOfGoods: { _text: "1" },
           },
           Valuation: {
             Currency: { _text: "USD" },
@@ -285,19 +321,19 @@ function structureDataForXml(consolidatedItems) {
           Items: (item.items || []).map(tariff => ({
             Code: { _text: tariff.code },
             Desc: { _text: tariff.desc },
-            Origin: { _text: tariff.origin },
+            Origin: { _text: "USA" },
             Qty: { _text: tariff.qty },
-            QtyUnit: { _text: tariff.qtyUnit },
+            QtyUnit: { _text: "LB" },
             Cost: { _text: tariff.cost },
             Insurance: { _text: tariff.insurance },
             Freight: { _text: tariff.freight },
             InvNumber: { _text: tariff.invNumber },
             Procedure: {
-              Code: { _text: tariff.procedure.code },
+              Code: { _text: "HOME" },
               ImporterNumber: { _text: tariff.procedure.importerNumber },
             },
           })),
-          MoneyDeclaredFlag: { _text: item.moneyDeclaredFlag },
+          MoneyDeclaredFlag: { _text: "N" },
         }))
       }
     }
