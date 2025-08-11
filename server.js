@@ -287,13 +287,7 @@ function structureDataForXml(consolidatedItems, masterBill) {
         Contents: { _text: masterBill.packages?.contents || '' },
         CategoryOfGoods: { _text: "1" },
       },
-      Valuation: {
-        Currency: { _text: 'USD' },
-        NetCost: { _text: masterBill.valuation?.netCost || '' },
-        NetInsurance: { _text: masterBill.valuation?.netInsurance || '' },
-        NetFreight: { _text: masterBill.valuation?.netFreight || '' },
-        TermsOfDelivery: { _text: "FOB" },
-      },
+    
       MoneyDeclaredFlag: { _text: "N" },
       ConsolidatedShipment: {
         ConsolidatedItem: consolidatedItems.map(item => ({
