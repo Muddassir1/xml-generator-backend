@@ -42715,28 +42715,23 @@
     },
     {
       "id": 3,
-      "name": "AJ Fashion",
-      "tin": "20005264"
+      "name": "AJ Fashion"
     },
     {
       "id": 4,
-      "name": "ATNV Management SEZC",
-      "tin": "21650223"
+      "name": "ATNV Management SEZC"
     },
     {
       "id": 5,
-      "name": "Aaliyah Paula Brown",
-      "tin": "222"
+      "name": "Aaliyah Paula Brown"
     },
     {
       "id": 6,
-      "name": "Aaliyah Webster",
-      "tin": "3333"
+      "name": "Aaliyah Webster"
     },
     {
       "id": 7,
-      "name": "Aaron Roye",
-      "tin": "312"
+      "name": "Aaron Roye"
     },
     {
       "id": 8,
@@ -42748,8 +42743,7 @@
     },
     {
       "id": 10,
-      "name": "Abigail Pritchard",
-      "tin": "5555"
+      "name": "Abigail Pritchard"
     },
     {
       "id": 11,
@@ -42769,8 +42763,7 @@
     },
     {
       "id": 15,
-      "name": "Adeneki Morrison",
-      "tin": "23123"
+      "name": "Adeneki Morrison"
     },
     {
       "id": 16,
@@ -43112,16 +43105,6 @@
     {
       "id": 100,
       "name": "Ann-Marie Teehan"
-    },
-    {
-      "id": "caf706b0-27f4-498f-9a87-cc836c30ca07",
-      "name": "Muddassir",
-      "tin": "13213"
-    },
-    {
-      "id": "0d1d15e5-c8e8-4310-a26a-7cf05314be08",
-      "name": "Yasir",
-      "tin": "77788899"
     }
   ],
   "exporters": [

@@ -267,7 +267,7 @@ function structureDataForXml(consolidatedItems, masterBill) {
         ExportCountry: { _text: "USA" },
         ImportCountry: { _text: "USA" },
         ShippingPort: { _text: masterBill.consignment?.shippingPort || '' },
-        DischargePort: { _text: mode == "SEA" ? 'KYGEC' : "KYGCM"},
+        DischargePort: { _text: mode == "SEA" ? 'KYGEC' : "KYGCM" },
         TransportMode: { _text: mode || '' },
       },
       Shipment: {
@@ -287,7 +287,6 @@ function structureDataForXml(consolidatedItems, masterBill) {
         Contents: { _text: masterBill.packages?.contents || '' },
         CategoryOfGoods: { _text: "1" },
       },
-    
       MoneyDeclaredFlag: { _text: "N" },
       ConsolidatedShipment: {
         ConsolidatedItem: consolidatedItems.map(item => ({
@@ -332,6 +331,24 @@ function structureDataForXml(consolidatedItems, masterBill) {
       }
     }
   };
+  if (masterBill.containers.length > 0) {
+    sadEntryObject.SADEntry.Container = []
+    masterBill.containers.forEach(container => {
+      const containerObject = {
+        ContainerType: { _text: container.containerType || '' },
+        ContainerNumber: { _text: container.containerNumber || '' },
+        DockReceipt: { _text: container.dockReceipt || '' },
+        MarksAndNumbers: { _text: container.marksNumbers || '' },
+        SealNumber: { _text: container.sealNumber || '' },
+        CubicSize: { _text: container.volume || '' },
+        CubicUnit: { _text: 'CF' },
+        GrossWt: { _text: container.weight || '' },
+        GrossWtUnit: { _text: 'LB' },
+      }
+      sadEntryObject.SADEntry.Container.push(containerObject)
+    });
+
+  }
   return sadEntryObject;
 }
 
