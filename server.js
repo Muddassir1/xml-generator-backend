@@ -44,7 +44,8 @@ app.post('/declarations', async (req, res) => {
   try {
     await db.read();
 
-    const newDeclaration = { ...req.body, id: uuidv4(), items: [] };
+    const { tariffs, ...declarationData } = req.body;
+    const newDeclaration = { ...declarationData, id: uuidv4(), items: [] };
     const { importer, exporter } = newDeclaration;
 
     // Handle new importer
@@ -65,6 +66,32 @@ app.post('/declarations', async (req, res) => {
     } else if (exporter?.id && exporter?.number) {
       const user = db.data.exporters.find(u => u.id === exporter.id);
       if (user) user.tin = exporter.number;
+    }
+
+    // Process tariffs if provided
+    if (tariffs && Array.isArray(tariffs) && tariffs.length > 0) {
+      // Validate that valuation data exists for tariff calculations
+      if (!newDeclaration.valuation?.netFreight || !newDeclaration.valuation?.netCost || !newDeclaration.valuation?.netInsurance) {
+        return res.status(400).json({
+          error: 'Declaration must include valuation data (netFreight, netCost, netInsurance) when creating tariffs.'
+        });
+      }
+
+      const netFreight = parseFloat(newDeclaration.valuation.netFreight);
+      const netCost = parseFloat(newDeclaration.valuation.netCost);
+      const netInsurance = parseFloat(newDeclaration.valuation.netInsurance);
+
+      // Process each tariff
+      const processedTariffs = tariffs.map(tariff => {
+        const finalId = tariff.id || uuidv4();
+        let rate = parseFloat(tariff.cost) / netCost;
+        let freight = rate * netFreight;
+        let insurance = rate * netInsurance;
+
+        return { ...tariff, id: finalId, freight, insurance };
+      });
+
+      newDeclaration.items = processedTariffs;
     }
 
     db.data.declarations.push(newDeclaration);
@@ -160,12 +187,20 @@ app.put('/declarations/:id/tariffs', async (req, res) => {
       return res.status(404).json({ error: 'Declaration not found.' });
     }
 
+    const netFreight = parseFloat(declaration.valuation.netFreight)
+    const netCost = parseFloat(declaration.valuation.netCost)
+    const netInsurance = parseFloat(declaration.valuation.netInsurance)
+
     // Create a map for quick lookup of incoming tariffs
     const incomingMap = new Map();
     const updatedTariffs = tariffs.map(tariff => {
       const finalId = tariff.id || uuidv4();
+
+      let rate = parseFloat(tariff.cost) / netCost;
+      let freight = rate * netFreight;
+      let insurance = rate * netInsurance;
       incomingMap.set(finalId, true);
-      return { ...tariff, id: finalId };
+      return { ...tariff, id: finalId, freight, insurance };
     });
 
     // Remove tariffs that are not in the incoming list

@@ -2,92 +2,110 @@
   "declarations": [
     {
       "importer": {
-        "id": 3,
-        "number": "20005264",
-        "name": "AJ Fashion"
+        "id": 1,
+        "number": "",
+        "name": "19N81W SEZC"
+      },
+      "exporter": {
+        "id": "24dac753-d19f-4da9-afa4-f6cc69d15261",
+        "number": "21735993",
+        "name": "NOVOTRANS"
+      },
+      "billNumber": "2",
+      "packages": {
+        "pkgCount": "2",
+        "pkgType": "CG",
+        "grossWt": "2",
+        "grossVol": "2",
+        "contents": "2"
+      },
+      "valuation": {
+        "netCost": "250",
+        "netInsurance": "100",
+        "netFreight": "200"
+      },
+      "id": "8975adc8-00b1-4744-8458-05ca22136a88",
+      "items": [
+        {
+          "code": "01----",
+          "desc": "Live animals.",
+          "qty": "1",
+          "cost": "100",
+          "invNumber": "123",
+          "procedure": {
+            "importerNumber": "22"
+          },
+          "id": "5ecf480e-d2d6-4f50-a17c-3a4bb9b7cd09",
+          "freight": 80,
+          "insurance": 40
+        },
+        {
+          "code": "01022900",
+          "desc": "Live cattle (excl. pure-bred for breeding)",
+          "qty": "50",
+          "cost": "150",
+          "invNumber": "123456789",
+          "procedure": {
+            "importerNumber": "45555"
+          },
+          "id": "3d0dfcb0-02fb-40f9-93a1-a2b69ff9833c",
+          "freight": 120,
+          "insurance": 60
+        }
+      ]
+    },
+    {
+      "importer": {
+        "id": 5,
+        "name": "Aaliyah Paula Brown"
+      },
+      "exporter": {
+        "id": 4,
+        "number": "21650223",
+        "name": "AROMA"
+      },
+      "billNumber": "2",
+      "packages": {
+        "pkgCount": "2",
+        "pkgType": "BG",
+        "grossWt": "2",
+        "grossVol": "2",
+        "contents": "2"
+      },
+      "valuation": {
+        "netCost": "2",
+        "netInsurance": "2",
+        "netFreight": "2"
+      },
+      "id": "56ecf24d-1d28-4846-8cd9-4a344a2bec36",
+      "items": []
+    },
+    {
+      "importer": {
+        "id": 5,
+        "number": "",
+        "name": "Aaliyah Paula Brown"
       },
       "exporter": {
         "id": 7,
         "number": "21702802",
         "name": "Andy Doggett"
       },
-      "billNumber": "BB123123",
+      "billNumber": "2",
       "packages": {
-        "pkgCount": "850",
-        "pkgType": "BX",
-        "grossWt": "100",
-        "grossVol": "78.50",
-        "contents": "Test Content",
-        "grossWtUnit": "2",
-        "grossVolUnit": "2",
-        "categoryOfGoods": "2"
+        "pkgCount": "2",
+        "pkgType": "BD",
+        "grossWt": "2",
+        "grossVol": "2",
+        "contents": "2"
       },
       "valuation": {
-        "netCost": "4000",
-        "netInsurance": "100",
-        "netFreight": "100",
-        "currency": "2",
-        "termsOfDelivery": "2"
+        "netCost": "2",
+        "netInsurance": "2",
+        "netFreight": "2"
       },
-      "moneyDeclaredFlag": "N",
-      "id": "e6ee7302-5315-40e1-9ce6-91cee1f79a13",
-      "items": [
-        {
-          "code": "29157000",
-          "desc": "Palmitic acid, stearic acid, their salts and esters",
-          "qty": "500",
-          "cost": "4000",
-          "insurance": "100",
-          "freight": "100",
-          "invNumber": "INV-DE-2025-001A",
-          "procedure": {
-            "code": "HOME",
-            "importerNumber": "21722827"
-          },
-          "id": "32c91d68-29e0-403c-b0e8-14e1039545e1"
-        }
-      ]
-    },
-    {
-      "importer": {
-        "id": 69,
-        "number": "20005264",
-        "name": "Amber Attridge"
-      },
-      "exporter": {
-        "id": 11,
-        "number": "21703476",
-        "name": "BOOHOO"
-      },
-      "billNumber": "CC123",
-      "packages": {
-        "pkgCount": "850",
-        "pkgType": "BX",
-        "grossWt": "100",
-        "grossVol": "78.50",
-        "contents": "Test Content"
-      },
-      "valuation": {
-        "netCost": "8000",
-        "netInsurance": "100",
-        "netFreight": "100"
-      },
-      "id": "aba5c205-c874-42a7-9671-140c36bb7ae3",
-      "items": [
-        {
-          "code": "29157000",
-          "desc": "Palmitic acid, stearic acid, their salts and esters",
-          "qty": "500",
-          "cost": "8000",
-          "insurance": "100",
-          "freight": "100",
-          "invNumber": "INV-DE-2025-001A",
-          "procedure": {
-            "importerNumber": "21722827"
-          },
-          "id": "2ba78c8d-3a0c-475f-97e3-442699027615"
-        }
-      ]
+      "id": "007db79c-05e7-42fd-bfb9-8f8f99670d9a",
+      "items": []
     }
   ],
   "tariffs": [
@@ -43105,6 +43123,31 @@
     {
       "id": 100,
       "name": "Ann-Marie Teehan"
+    },
+    {
+      "id": "c87775b7-c6bb-4f04-a103-c822392cbe89",
+      "name": "Umer",
+      "tin": "123123123"
+    },
+    {
+      "id": "db2283cf-3f6b-4a1a-baff-d63dbda60182",
+      "name": "Yasir",
+      "tin": "2222222"
+    },
+    {
+      "id": "e4513a72-8f0e-4ef1-bfc2-264860bb65a5",
+      "name": "muddassir",
+      "tin": "8585"
+    },
+    {
+      "id": "4fb3ca0c-5df4-425c-ac76-0abe23da5ce8",
+      "name": "new user",
+      "tin": "587458"
+    },
+    {
+      "id": "5703eaeb-53a9-42e5-8ee6-a6ce94e4264d",
+      "name": "another",
+      "tin": "232"
     }
   ],
   "exporters": [
@@ -43532,6 +43575,11 @@
       "id": 85,
       "tin": "21411491",
       "name": "ebay"
+    },
+    {
+      "id": "24dac753-d19f-4da9-afa4-f6cc69d15261",
+      "name": "NOVOTRANS",
+      "tin": "21735993"
     }
   ]
 }
