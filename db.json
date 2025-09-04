@@ -2,110 +2,85 @@
   "declarations": [
     {
       "importer": {
-        "id": 1,
-        "number": "",
-        "name": "19N81W SEZC"
+        "id": "c8287539-e952-4b9c-9506-89c9d7188e59",
+        "number": "20005264",
+        "name": "Richard Christian"
       },
       "exporter": {
-        "id": "24dac753-d19f-4da9-afa4-f6cc69d15261",
-        "number": "21735993",
-        "name": "NOVOTRANS"
+        "id": 6,
+        "number": "21623614",
+        "name": "Amazon "
       },
-      "billNumber": "2",
+      "billNumber": "HBOL5209",
       "packages": {
-        "pkgCount": "2",
-        "pkgType": "CG",
-        "grossWt": "2",
-        "grossVol": "2",
-        "contents": "2"
+        "pkgCount": "3",
+        "pkgType": "PK",
+        "grossWt": "556.60",
+        "grossVol": "109.82",
+        "contents": "A/C, Mirror/Tire"
       },
       "valuation": {
-        "netCost": "250",
-        "netInsurance": "100",
-        "netFreight": "200"
+        "netCost": "4037.03",
+        "netInsurance": "45.68",
+        "netFreight": "530.84"
       },
-      "id": "8975adc8-00b1-4744-8458-05ca22136a88",
+      "id": "67ae5dbf-00e2-458a-82ea-1bed06793fe0",
       "items": [
-        {
-          "code": "01----",
-          "desc": "Live animals.",
-          "qty": "1",
-          "cost": "100",
-          "invNumber": "123",
-          "procedure": {
-            "importerNumber": "22"
-          },
-          "id": "5ecf480e-d2d6-4f50-a17c-3a4bb9b7cd09",
-          "freight": 80,
-          "insurance": 40
-        },
         {
           "code": "01022900",
           "desc": "Live cattle (excl. pure-bred for breeding)",
-          "qty": "50",
-          "cost": "150",
-          "invNumber": "123456789",
+          "qty": "1",
+          "cost": "4037.03",
+          "invNumber": "123456",
           "procedure": {
-            "importerNumber": "45555"
+            "importerNumber": "123123123"
           },
-          "id": "3d0dfcb0-02fb-40f9-93a1-a2b69ff9833c",
-          "freight": 120,
-          "insurance": 60
+          "id": "c407a84d-20f6-455b-97e5-17af571df379",
+          "freight": 530.84,
+          "insurance": 45.68
         }
       ]
     },
     {
       "importer": {
-        "id": 5,
-        "name": "Aaliyah Paula Brown"
+        "id": "e816ea90-8bf3-456e-b4e3-e0b2ba3cbe30",
+        "number": "21713457",
+        "name": "ANTHONY AW WILLIAMS"
       },
       "exporter": {
-        "id": 4,
-        "number": "21650223",
-        "name": "AROMA"
+        "id": "12af4b83-a2a8-4dac-bac5-1e4b18d49ac5",
+        "number": "21748035",
+        "name": "Alibaba"
       },
-      "billNumber": "2",
+      "billNumber": "HBOL5211",
       "packages": {
         "pkgCount": "2",
-        "pkgType": "BG",
-        "grossWt": "2",
-        "grossVol": "2",
-        "contents": "2"
+        "pkgType": "PK",
+        "grossWt": "3.25",
+        "grossVol": "0.63",
+        "contents": "test"
       },
       "valuation": {
-        "netCost": "2",
-        "netInsurance": "2",
-        "netFreight": "2"
+        "netCost": "170.25",
+        "netInsurance": "1.73",
+        "netFreight": "3.05"
       },
-      "id": "56ecf24d-1d28-4846-8cd9-4a344a2bec36",
-      "items": []
-    },
-    {
-      "importer": {
-        "id": 5,
-        "number": "",
-        "name": "Aaliyah Paula Brown"
-      },
-      "exporter": {
-        "id": 7,
-        "number": "21702802",
-        "name": "Andy Doggett"
-      },
-      "billNumber": "2",
-      "packages": {
-        "pkgCount": "2",
-        "pkgType": "BD",
-        "grossWt": "2",
-        "grossVol": "2",
-        "contents": "2"
-      },
-      "valuation": {
-        "netCost": "2",
-        "netInsurance": "2",
-        "netFreight": "2"
-      },
-      "id": "007db79c-05e7-42fd-bfb9-8f8f99670d9a",
-      "items": []
+      "id": "6db7ef8a-a435-4c2e-80aa-7b5ece40eb9c",
+      "items": [
+        {
+          "code": "01022100",
+          "desc": "Pure-bred cattle for breeding (cows, bulls)",
+          "qty": "1",
+          "cost": "170.25",
+          "invNumber": "12312",
+          "procedure": {
+            "importerNumber": "12312"
+          },
+          "id": "57dc76e7-04b4-43d2-86a3-2cf70bb36a44",
+          "freight": 3.05,
+          "insurance": 1.73
+        }
+      ]
     }
   ],
   "tariffs": [
@@ -43148,6 +43123,16 @@
       "id": "5703eaeb-53a9-42e5-8ee6-a6ce94e4264d",
       "name": "another",
       "tin": "232"
+    },
+    {
+      "id": "e816ea90-8bf3-456e-b4e3-e0b2ba3cbe30",
+      "name": "ANTHONY AW WILLIAMS",
+      "tin": "21713457"
+    },
+    {
+      "id": "c8287539-e952-4b9c-9506-89c9d7188e59",
+      "name": "Richard Christian",
+      "tin": "20005264"
     }
   ],
   "exporters": [
@@ -43580,6 +43565,58 @@
       "id": "24dac753-d19f-4da9-afa4-f6cc69d15261",
       "name": "NOVOTRANS",
       "tin": "21735993"
+    },
+    {
+      "id": "539e19c0-9916-4401-b03b-c79af0d5219a",
+      "name": "Richard Christian",
+      "tin": "20005264"
+    },
+    {
+      "id": "12af4b83-a2a8-4dac-bac5-1e4b18d49ac5",
+      "name": "Alibaba",
+      "tin": "21748035"
     }
-  ]
+  ],
+  "masterBill": {
+    "id": "30c9fa24-d681-44e4-b6d9-e1d9c3282e69",
+    "createdAt": "2025-09-03T14:15:45.988Z",
+    "updatedAt": "2025-09-03T14:15:45.988Z",
+    "exporter": {
+      "id": "24dac753-d19f-4da9-afa4-f6cc69d15261",
+      "number": "21735993"
+    },
+    "consignment": {
+      "departureDate": "2025-08-28",
+      "arrivalDate": "2025-08-30",
+      "exportCountry": "",
+      "importCountry": "",
+      "shippingPort": "USPEF",
+      "dischargePort": "",
+      "transportMode": "SEA"
+    },
+    "shipment": {
+      "vesselCode": "CBVG",
+      "voyageNo": "78",
+      "shippingAgent": "SB",
+      "billNumber": "SMLU8723284A"
+    },
+    "packages": {
+      "pkgCount": "1",
+      "pkgType": "CN",
+      "grossWt": "0",
+      "grossVol": "0",
+      "contents": "Furniture Homeware Tires A/C"
+    },
+    "containers": [
+      {
+        "containerType": "20CT",
+        "containerNumber": "2580477",
+        "dockReceipt": "2580477",
+        "marksNumbers": "243179",
+        "sealNumber": "243179",
+        "volume": "837.04",
+        "weight": "10427.70"
+      }
+    ]
+  }
 }

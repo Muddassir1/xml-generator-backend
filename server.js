@@ -260,6 +260,29 @@ app.get('/exporters', async (req, res) => {
 });
 
 
+app.get('/master-bill', async (req, res) => {
+  try {
+    await db.read();
+
+    // Check if master bill exists in database
+    if (!db.data.masterBill) {
+      return res.status(404).json({
+        error: 'No master bill found in database.',
+        masterBill: null
+      });
+    }
+
+    // Return the master bill data
+    res.status(200).json(db.data.masterBill);
+
+  } catch (error) {
+    console.error('Error fetching master bill:', error);
+    res.status(500).json({
+      error: 'An internal server error occurred while fetching master bill.'
+    });
+  }
+});
+
 // ----------------------------------------------------------------------
 // XML Generation (reading from DB)
 // ----------------------------------------------------------------------
@@ -273,6 +296,20 @@ app.post('/generate-xml', async (req, res) => {
       return res.status(400).json({ error: 'No declarations in DB.' });
     }
 
+    // Save master bill data to database (single object, not array)
+    const masterBillEntry = {
+      id: uuidv4(), // You'll need to implement this function or use a library like uuid
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      ...masterBill
+    };
+
+    // Save the master bill as a single object
+    db.data.masterBill = masterBillEntry;
+
+    // Write changes to the database
+    await db.write();
+
     const structuredJs = structureDataForXml(declarations, masterBill);
     const xmlData = js2xml(structuredJs, { compact: true, spaces: 4 });
 
@@ -285,6 +322,7 @@ app.post('/generate-xml', async (req, res) => {
     res.status(500).json({ error: 'An internal server error occurred.' });
   }
 });
+
 
 function structureDataForXml(consolidatedItems, masterBill) {
   const mode = masterBill.consignment?.transportMode;
@@ -312,6 +350,8 @@ function structureDataForXml(consolidatedItems, masterBill) {
         BillNumber: { _text: masterBill.shipment?.billNumber || '' },
         BillType: { _text: "CONSOLIDATED" },
       },
+      // Container section moved here - before Packages
+      Container: [],
       Packages: {
         PkgCount: { _text: masterBill.packages?.pkgCount || '' },
         PkgType: { _text: masterBill.packages.pkgType },
@@ -366,24 +406,25 @@ function structureDataForXml(consolidatedItems, masterBill) {
       }
     }
   };
-  if (masterBill.containers.length > 0) {
-    sadEntryObject.SADEntry.Container = []
+
+  // Populate Container array
+  if (masterBill.containers && masterBill.containers.length > 0) {
     masterBill.containers.forEach(container => {
       const containerObject = {
-        ContainerType: { _text: container.containerType || '' },
         ContainerNumber: { _text: container.containerNumber || '' },
+        ContainerType: { _text: container.containerType || '' },
+        SealNumber: { _text: container.sealNumber || '' },
         DockReceipt: { _text: container.dockReceipt || '' },
         MarksAndNumbers: { _text: container.marksNumbers || '' },
-        SealNumber: { _text: container.sealNumber || '' },
         CubicSize: { _text: container.volume || '' },
         CubicUnit: { _text: 'CF' },
         GrossWt: { _text: container.weight || '' },
         GrossWtUnit: { _text: 'LB' },
       }
-      sadEntryObject.SADEntry.Container.push(containerObject)
+      sadEntryObject.SADEntry.Container.push(containerObject);
     });
-
   }
+
   return sadEntryObject;
 }
 
