@@ -88,7 +88,7 @@ app.post('/declarations', async (req, res) => {
         let freight = rate * netFreight;
         let insurance = rate * netInsurance;
 
-        return { ...tariff, id: finalId, freight, insurance };
+        return { ...tariff, id: finalId, freight: freight.toFixed(2), insurance: insurance.toFixed(2) };
       });
 
       newDeclaration.items = processedTariffs;
@@ -200,7 +200,7 @@ app.put('/declarations/:id/tariffs', async (req, res) => {
       let freight = rate * netFreight;
       let insurance = rate * netInsurance;
       incomingMap.set(finalId, true);
-      return { ...tariff, id: finalId, freight, insurance };
+      return { ...tariff, id: finalId, freight: freight.toFixed(2), insurance: insurance.toFixed(2) };
     });
 
     // Remove tariffs that are not in the incoming list
