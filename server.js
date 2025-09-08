@@ -398,7 +398,7 @@ function structureDataForXml(consolidatedItems, masterBill) {
             InvNumber: { _text: tariff.invNumber },
             Procedure: {
               Code: { _text: "HOME" },
-              ImporterNumber: { _text: tariff.procedure.importerNumber },
+              ImporterNumber: { _text: "20738450" },
             },
           })),
           MoneyDeclaredFlag: { _text: "N" },
