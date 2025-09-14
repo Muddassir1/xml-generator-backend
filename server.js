@@ -13,9 +13,14 @@ import { v4 as uuidv4 } from 'uuid';
 // Database Setup
 // ----------------------------------------------------------------------
 const adapter = new JSONFile('db.json');
-const defaultData = { declarations: [] };
+const defaultData = { declarations: [], exporters: [] };
 const db = new Low(adapter, defaultData);
 await db.read();
+
+const usersAdapter = new JSONFile('users.json');
+const usersDefaultData = { users: [] };
+const usersDb = new Low(usersAdapter, usersDefaultData);
+await usersDb.read();
 
 // ----------------------------------------------------------------------
 // App Initialization & Middleware
@@ -39,33 +44,59 @@ app.get('/declarations', async (req, res) => {
   }
 });
 
-// POST a new declaration
 app.post('/declarations', async (req, res) => {
   try {
     await db.read();
+    await usersDb.read();
 
     const { tariffs, ...declarationData } = req.body;
     const newDeclaration = { ...declarationData, id: uuidv4(), items: [] };
     const { importer, exporter } = newDeclaration;
 
-    // Handle new importer
-    if (!importer?.id && importer?.name && importer?.number) {
-      const newImporter = { id: uuidv4(), name: importer.name, tin: importer.number };
-      db.data.users.push(newImporter);
-      newDeclaration.importer.id = newImporter.id;
-    } else if (importer?.id && importer?.number) {
-      const user = db.data.users.find(u => u.id === importer.id);
-      if (user) user.tin = importer.number;
+    // Handle importer - check by TIN number
+    let importerId;
+    if (importer?.id) {
+      // Existing importer - find by ID and update TIN
+      const existingUser = usersDb.data.users.find(u => u.id === importer.id);
+      if (existingUser) {
+        // Update TIN number (always, since it's provided in request)
+        existingUser.tin = importer.number;
+        await usersDb.write();
+        importerId = existingUser.id;
+        newDeclaration.importer.id = importerId;
+      }
+    } else {
+      // New importer - create new user
+      const newImporter = {
+        id: uuidv4(),
+        name: importer.name || '',
+        tin: importer.number
+      };
+      usersDb.data.users.push(newImporter);
+      importerId = newImporter.id;
+      newDeclaration.importer.id = importerId;
+      await usersDb.write();
     }
 
-    // Handle new exporter
-    if (!exporter?.id && exporter?.name && exporter?.number) {
-      const newExporter = { id: uuidv4(), name: exporter.name, tin: exporter.number };
-      db.data.exporters.push(newExporter);
-      newDeclaration.exporter.id = newExporter.id;
-    } else if (exporter?.id && exporter?.number) {
-      const user = db.data.exporters.find(u => u.id === exporter.id);
-      if (user) user.tin = exporter.number;
+    // Handle exporter - associate with importer
+    if (exporter?.number && importerId) {
+      const existingExporter = db.data.exporters.find(e =>
+        e.tin === exporter.number && e.uid === importerId
+      );
+
+      if (existingExporter) {
+        newDeclaration.exporter.id = existingExporter.id;
+      } else {
+        // Create new exporter associated with the importer
+        const newExporter = {
+          id: uuidv4(),
+          name: exporter.name || '',
+          tin: exporter.number,
+          uid: importerId // Associate with importer
+        };
+        db.data.exporters.push(newExporter);
+        newDeclaration.exporter.id = newExporter.id;
+      }
     }
 
     // Process tariffs if provided
@@ -111,6 +142,8 @@ app.put('/declarations/:id', async (req, res) => {
     const updatedData = req.body;
 
     await db.read();
+    await usersDb.read();
+
     const declarationIndex = db.data.declarations.findIndex(d => d.id === id);
     if (declarationIndex === -1) {
       return res.status(404).json({ error: 'Declaration not found.' });
@@ -118,24 +151,67 @@ app.put('/declarations/:id', async (req, res) => {
 
     const { importer, exporter } = updatedData;
 
-    // Handle new importer
-    if (!importer?.id && importer?.name && importer?.number) {
-      const newImporter = { id: uuidv4(), name: importer.name, tin: importer.number };
-      db.data.users.push(newImporter);
-      updatedData.importer.id = newImporter.id;
-    } else if (importer?.id && importer?.number) {
-      const user = db.data.users.find(u => u.id === importer.id);
-      if (user) user.tin = importer.number;
+    // Handle importer logic
+    let importerId;
+    if (importer?.id) {
+      // Existing importer - find by ID and update TIN
+      const existingUser = usersDb.data.users.find(u => u.id === importer.id);
+      if (existingUser) {
+        // Update TIN number (always, since it's provided in request)
+        existingUser.tin = importer.number;
+        await usersDb.write();
+        importerId = existingUser.id;
+        updatedData.importer.id = importerId;
+      }
+    } else {
+      // New importer - create new user
+      const newImporter = {
+        id: uuidv4(),
+        name: importer.name || '',
+        tin: importer.number
+      };
+      usersDb.data.users.push(newImporter);
+      importerId = newImporter.id;
+      updatedData.importer.id = importerId;
+      await usersDb.write();
     }
 
-    // Handle new exporter
-    if (!exporter?.id && exporter?.name && exporter?.number) {
-      const newExporter = { id: uuidv4(), name: exporter.name, tin: exporter.number };
-      db.data.exporters.push(newExporter);
-      updatedData.exporter.id = newExporter.id;
-    } else if (exporter?.id && exporter?.number) {
-      const user = db.data.exporters.find(u => u.id === exporter.id);
-      if (user) user.tin = exporter.number;
+    // Handle exporter - check by ID, associate with importer if provided
+    if (exporter?.id || (exporter?.name && exporter?.number)) {
+      let exporterId;
+
+      if (exporter.id) {
+        const existingExporter = db.data.exporters.find(e => e.id === exporter.id);
+        if (existingExporter) {
+          // Update association with importer if not already set
+          if (!existingExporter.uid && importerId) {
+            existingExporter.uid = importerId;
+          }
+          exporterId = existingExporter.id;
+        } else {
+          // Create new exporter with the provided ID
+          const newExporter = {
+            id: exporter.id,
+            name: exporter.name || '',
+            tin: exporter.number || '',
+            uid: importerId || null
+          };
+          db.data.exporters.push(newExporter);
+          exporterId = newExporter.id;
+        }
+      } else {
+        // Create new exporter with generated ID
+        const newExporter = {
+          id: uuidv4(),
+          name: exporter.name || '',
+          tin: exporter.number || '',
+          uid: importerId || null
+        };
+        db.data.exporters.push(newExporter);
+        exporterId = newExporter.id;
+      }
+
+      updatedData.exporter.id = exporterId;
     }
 
     const existingItems = db.data.declarations[declarationIndex].items;
@@ -148,8 +224,6 @@ app.put('/declarations/:id', async (req, res) => {
     res.status(500).json({ error: 'Failed to update declaration.' });
   }
 });
-
-
 // DELETE a declaration
 app.delete('/declarations/:id', async (req, res) => {
   try {
@@ -225,7 +299,6 @@ app.put('/declarations/:id/tariffs', async (req, res) => {
   }
 });
 
-
 // Get all tariffs
 app.get('/tariffs', async (req, res) => {
   await db.read();
@@ -233,19 +306,17 @@ app.get('/tariffs', async (req, res) => {
   res.json(codes);
 });
 
-
 // GET all users
 app.get('/users', async (req, res) => {
   try {
-    await db.read();
-    const users = db.data.users || [];
+    await usersDb.read();
+    const users = usersDb.data.users || [];
     res.status(200).json(users);
   } catch (error) {
     console.error('Failed to fetch users:', error);
     res.status(500).json({ error: 'Failed to fetch users.' });
   }
 });
-
 
 // GET all exporters
 app.get('/exporters', async (req, res) => {
@@ -259,6 +330,18 @@ app.get('/exporters', async (req, res) => {
   }
 });
 
+// GET exporters for a specific importer
+app.get('/exporters/by-importer/:importerId', async (req, res) => {
+  try {
+    const { importerId } = req.params;
+    await db.read();
+    const exporters = db.data.exporters.filter(e => e.uid === importerId) || [];
+    res.status(200).json(exporters);
+  } catch (error) {
+    console.error('Failed to fetch exporters:', error);
+    res.status(500).json({ error: 'Failed to fetch exporters.' });
+  }
+});
 
 app.get('/master-bill', async (req, res) => {
   try {
@@ -322,7 +405,6 @@ app.post('/generate-xml', async (req, res) => {
     res.status(500).json({ error: 'An internal server error occurred.' });
   }
 });
-
 
 function structureDataForXml(consolidatedItems, masterBill) {
   const mode = masterBill.consignment?.transportMode;
@@ -398,7 +480,7 @@ function structureDataForXml(consolidatedItems, masterBill) {
             InvNumber: { _text: tariff.invNumber },
             Procedure: {
               Code: { _text: "HOME" },
-              ImporterNumber: { _text: "20738450" },
+              ImporterNumber: { _text: item.importer.number },
             },
           })),
           MoneyDeclaredFlag: { _text: "N" },

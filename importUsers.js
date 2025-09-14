@@ -8,7 +8,7 @@ import { JSONFile } from 'lowdb/node';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const dbFile = path.join(__dirname, 'db.json');
+const dbFile = path.join(__dirname, 'users.json');
 const csvFile = path.join(__dirname, 'users.csv');
 
 // Create adapter and database
