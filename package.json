@@ -8,6 +8,12 @@
     "start": "nodemon server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "nodemonConfig": {
+    "ignore": [
+      "db.json",
+      "users.json"
+    ]
+  },
   "author": "",
   "license": "ISC",
   "dependencies": {
