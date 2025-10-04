@@ -38,7 +38,16 @@ app.use(bodyParser.json());
 app.get('/declarations', async (req, res) => {
   try {
     await db.read();
-    res.status(200).json(db.data.declarations);
+    const { transportMode } = req.query;
+    
+    let filteredDeclarations = db.data.declarations;
+    if (transportMode) {
+      filteredDeclarations = db.data.declarations.filter(declaration => 
+        declaration.transportMode === transportMode
+      );
+    }
+    
+    res.status(200).json(filteredDeclarations);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch declarations.' });
   }
@@ -78,21 +87,51 @@ app.post('/declarations', async (req, res) => {
       await usersDb.write();
     }
 
-    // Handle exporter - associate with importer
-    if (exporter?.number && importerId) {
-      const existingExporter = db.data.exporters.find(e =>
-        e.tin === exporter.number && e.uid === importerId
-      );
-
-      if (existingExporter) {
-        newDeclaration.exporter.id = existingExporter.id;
+    // Handle exporter - associate with importer (supports with/without TIN)
+    if (importerId && exporter) {
+      // If exporter has TIN, try to reuse by (tin + importerId)
+      if (exporter.number) {
+        const existingByTin = db.data.exporters.find(e => e.tin === exporter.number && e.uid === importerId);
+        if (existingByTin) {
+          // Optionally update basic fields
+          existingByTin.name = exporter.name || existingByTin.name || '';
+          existingByTin.address = exporter.address || existingByTin.address || '';
+          existingByTin.city = exporter.city || existingByTin.city || '';
+          existingByTin.state = exporter.state || existingByTin.state || '';
+          existingByTin.postalcode = exporter.postalcode || existingByTin.postalcode || '';
+          existingByTin.country = exporter.country || existingByTin.country || '';
+          existingByTin.phone = exporter.phone || existingByTin.phone || '';
+          await db.write();
+          newDeclaration.exporter.id = existingByTin.id;
+        } else {
+          const newExporter = {
+            id: uuidv4(),
+            name: exporter.name || '',
+            tin: exporter.number || '',
+            address: exporter.address || '',
+            city: exporter.city || '',
+            state: exporter.state || '',
+            postalcode: exporter.postalcode || '',
+            country: exporter.country || '',
+            phone: exporter.phone || '',
+            uid: importerId
+          };
+          db.data.exporters.push(newExporter);
+          newDeclaration.exporter.id = newExporter.id;
+        }
       } else {
-        // Create new exporter associated with the importer
+        // No TIN path: always create a new exporter record linked to the importer
         const newExporter = {
           id: uuidv4(),
           name: exporter.name || '',
-          tin: exporter.number,
-          uid: importerId // Associate with importer
+          tin: '',
+          address: exporter.address || '',
+          city: exporter.city || '',
+          state: exporter.state || '',
+          postalcode: exporter.postalcode || '',
+          country: exporter.country || '',
+          phone: exporter.phone || '',
+          uid: importerId
         };
         db.data.exporters.push(newExporter);
         newDeclaration.exporter.id = newExporter.id;
@@ -101,25 +140,36 @@ app.post('/declarations', async (req, res) => {
 
     // Process tariffs if provided
     if (tariffs && Array.isArray(tariffs) && tariffs.length > 0) {
-      // Validate that valuation data exists for tariff calculations
-      if (!newDeclaration.valuation?.netFreight || !newDeclaration.valuation?.netCost || !newDeclaration.valuation?.netInsurance) {
-        return res.status(400).json({
-          error: 'Declaration must include valuation data (netFreight, netCost, netInsurance) when creating tariffs.'
-        });
-      }
-
-      const netFreight = parseFloat(newDeclaration.valuation.netFreight);
-      const netCost = parseFloat(newDeclaration.valuation.netCost);
-      const netInsurance = parseFloat(newDeclaration.valuation.netInsurance);
+      // Check if valuation data exists for tariff calculations
+      const netFreight = parseFloat(newDeclaration.valuation?.netFreight || 0);
+      const netCost = parseFloat(newDeclaration.valuation?.netCost || 0);
+      const netInsurance = parseFloat(newDeclaration.valuation?.netInsurance || 0);
 
       // Process each tariff
       const processedTariffs = tariffs.map(tariff => {
         const finalId = tariff.id || uuidv4();
-        let rate = parseFloat(tariff.cost) / netCost;
-        let freight = rate * netFreight;
-        let insurance = rate * netInsurance;
-
-        return { ...tariff, id: finalId, freight: freight.toFixed(2), insurance: insurance.toFixed(2) };
+        
+        // Only calculate freight and insurance if we have the required valuation data
+        if (netCost > 0) {
+          let rate = parseFloat(tariff.cost) / netCost;
+          let freight = rate * netFreight;
+          let insurance = rate * netInsurance;
+          
+          return { 
+            ...tariff, 
+            id: finalId, 
+            freight: freight.toFixed(2), 
+            insurance: insurance.toFixed(2) 
+          };
+        } else {
+          // If no valuation data, just store the tariff without calculated freight/insurance
+          return { 
+            ...tariff, 
+            id: finalId, 
+            freight: '0.00', 
+            insurance: '0.00' 
+          };
+        }
       });
 
       newDeclaration.items = processedTariffs;
@@ -176,8 +226,8 @@ app.put('/declarations/:id', async (req, res) => {
       await usersDb.write();
     }
 
-    // Handle exporter - check by ID, associate with importer if provided
-    if (exporter?.id || (exporter?.name && exporter?.number)) {
+    // Handle exporter - check by ID, associate with importer if provided (supports without TIN)
+    if (exporter?.id || exporter?.name) {
       let exporterId;
 
       if (exporter.id) {
@@ -187,6 +237,15 @@ app.put('/declarations/:id', async (req, res) => {
           if (!existingExporter.uid && importerId) {
             existingExporter.uid = importerId;
           }
+          // Update fields
+          if (typeof exporter.name === 'string') existingExporter.name = exporter.name;
+          if (typeof exporter.number === 'string') existingExporter.tin = exporter.number;
+          if (typeof exporter.address === 'string') existingExporter.address = exporter.address;
+          if (typeof exporter.city === 'string') existingExporter.city = exporter.city;
+          if (typeof exporter.state === 'string') existingExporter.state = exporter.state;
+          if (typeof exporter.postalcode === 'string') existingExporter.postalcode = exporter.postalcode;
+          if (typeof exporter.country === 'string') existingExporter.country = exporter.country;
+          if (typeof exporter.phone === 'string') existingExporter.phone = exporter.phone;
           exporterId = existingExporter.id;
         } else {
           // Create new exporter with the provided ID
@@ -194,6 +253,12 @@ app.put('/declarations/:id', async (req, res) => {
             id: exporter.id,
             name: exporter.name || '',
             tin: exporter.number || '',
+            address: exporter.address || '',
+            city: exporter.city || '',
+            state: exporter.state || '',
+            postalcode: exporter.postalcode || '',
+            country: exporter.country || '',
+            phone: exporter.phone || '',
             uid: importerId || null
           };
           db.data.exporters.push(newExporter);
@@ -205,6 +270,12 @@ app.put('/declarations/:id', async (req, res) => {
           id: uuidv4(),
           name: exporter.name || '',
           tin: exporter.number || '',
+          address: exporter.address || '',
+          city: exporter.city || '',
+          state: exporter.state || '',
+          postalcode: exporter.postalcode || '',
+          country: exporter.country || '',
+          phone: exporter.phone || '',
           uid: importerId || null
         };
         db.data.exporters.push(newExporter);
@@ -234,6 +305,34 @@ app.delete('/declarations/:id', async (req, res) => {
     res.status(200).json({ message: 'Declaration deleted successfully.' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete declaration.' });
+  }
+});
+
+// DELETE multiple declarations (bulk delete)
+app.delete('/declarations', async (req, res) => {
+  try {
+    const { ids } = req.body;
+    
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: 'Please provide an array of declaration IDs to delete.' });
+    }
+
+    await db.read();
+    const initialCount = db.data.declarations.length;
+    
+    // Filter out the declarations with the provided IDs
+    db.data.declarations = db.data.declarations.filter(d => !ids.includes(d.id));
+    
+    const deletedCount = initialCount - db.data.declarations.length;
+    await db.write();
+    
+    res.status(200).json({ 
+      message: `Successfully deleted ${deletedCount} declaration${deletedCount > 1 ? 's' : ''}.`,
+      deletedCount 
+    });
+  } catch (error) {
+    console.error('Error deleting declarations:', error);
+    res.status(500).json({ error: 'Failed to delete declarations.' });
   }
 });
 
@@ -448,7 +547,17 @@ function structureDataForXml(consolidatedItems, masterBill) {
       ConsolidatedShipment: {
         ConsolidatedItem: consolidatedItems.map(item => ({
           Importer: { Number: { _text: item.importer.number } },
-          Exporter: { Number: { _text: item.exporter.number } },
+          Exporter: item.exporter?.number
+            ? { Number: { _text: item.exporter.number } }
+            : {
+                Name: { _text: item.exporter?.name || '' },
+                Address: { _text: item.exporter?.address || '' },
+                City: { _text: item.exporter?.city || '' },
+                State: { _text: item.exporter?.state || '' },
+                PostalCode: { _text: item.exporter?.postalcode || '' },
+                Country: { _text: item.exporter?.country || '' },
+                Phone: { _text: item.exporter?.phone || '' }
+              },
           Finance: {},
           BillNumber: { _text: item.billNumber },
           Packages: {
