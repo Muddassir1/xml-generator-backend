@@ -9,6 +9,37 @@ import { Low } from 'lowdb';
 import { JSONFile } from 'lowdb/node';
 import { v4 as uuidv4 } from 'uuid';
 
+/**
+ * Allocate a monetary total (dollars) proportionally across weights (e.g. tariff costs)
+ * using integer cents and the largest-remainder method so allocations sum exactly to total.
+ * Returns an array of strings formatted to two decimals (e.g. "12.34").
+ */
+function allocateProportionalToCents(totalAmount, weights) {
+  const totalCents = Math.round(Number(totalAmount) * 100);
+  const weightNums = weights.map(w => Number(w) || 0);
+  const weightSum = weightNums.reduce((s, v) => s + v, 0);
+
+  if (totalCents === 0 || weightSum === 0) {
+    // Return zero for each weight if nothing to distribute or no weights
+    return weights.map(() => (0).toFixed(2));
+  }
+
+  // compute exact shares in cents (may be fractional), floor them, record fractions
+  const exactShares = weightNums.map(w => (w / weightSum) * totalCents);
+  const floorShares = exactShares.map(s => Math.floor(s));
+  const fractions = exactShares.map((s, i) => ({ i, frac: s - floorShares[i] }));
+
+  // Distribute remaining cents by largest fractional remainders
+  let assigned = floorShares.reduce((a, b) => a + b, 0);
+  let remainder = totalCents - assigned;
+  fractions.sort((a, b) => b.frac - a.frac);
+  for (let k = 0; k < remainder; k++) {
+    floorShares[fractions[k].i] += 1;
+  }
+
+  return floorShares.map(c => (c / 100).toFixed(2));
+}
+
 // ----------------------------------------------------------------------
 // Database Setup
 // ----------------------------------------------------------------------
@@ -145,34 +176,30 @@ app.post('/declarations', async (req, res) => {
       const netCost = parseFloat(newDeclaration.valuation?.netCost || 0);
       const netInsurance = parseFloat(newDeclaration.valuation?.netInsurance || 0);
 
-      // Process each tariff
-      const processedTariffs = tariffs.map(tariff => {
-        const finalId = tariff.id || uuidv4();
-        
-        // Only calculate freight and insurance if we have the required valuation data
-        if (netCost > 0) {
-          let rate = parseFloat(tariff.cost) / netCost;
-          let freight = rate * netFreight;
-          let insurance = rate * netInsurance;
-          
-          return { 
-            ...tariff, 
-            id: finalId, 
-            freight: freight.toFixed(2), 
-            insurance: insurance.toFixed(2) 
-          };
-        } else {
-          // If no valuation data, just store the tariff without calculated freight/insurance
-          return { 
-            ...tariff, 
-            id: finalId, 
-            freight: '0.00', 
-            insurance: '0.00' 
-          };
-        }
-      });
+      if (netCost > 0) {
+        // Build cost array for proportional allocation
+        const costNums = tariffs.map(t => parseFloat(t.cost || 0));
+        const freightAlloc = allocateProportionalToCents(netFreight, costNums);
+        const insuranceAlloc = allocateProportionalToCents(netInsurance, costNums);
 
-      newDeclaration.items = processedTariffs;
+        const processedTariffs = tariffs.map((tariff, idx) => ({
+          ...tariff,
+          id: tariff.id || uuidv4(),
+          freight: freightAlloc[idx],
+          insurance: insuranceAlloc[idx]
+        }));
+
+        newDeclaration.items = processedTariffs;
+      } else {
+        // If no valuation data, just store the tariff without calculated freight/insurance
+        const processedTariffs = tariffs.map(tariff => ({
+          ...tariff,
+          id: tariff.id || uuidv4(),
+          freight: '0.00',
+          insurance: '0.00'
+        }));
+        newDeclaration.items = processedTariffs;
+      }
     }
 
     db.data.declarations.push(newDeclaration);
@@ -360,21 +387,33 @@ app.put('/declarations/:id/tariffs', async (req, res) => {
       return res.status(404).json({ error: 'Declaration not found.' });
     }
 
-    const netFreight = parseFloat(declaration.valuation.netFreight)
-    const netCost = parseFloat(declaration.valuation.netCost)
-    const netInsurance = parseFloat(declaration.valuation.netInsurance)
+
+    const netFreight = parseFloat(declaration.valuation.netFreight || 0);
+    const netCost = parseFloat(declaration.valuation.netCost || 0);
+    const netInsurance = parseFloat(declaration.valuation.netInsurance || 0);
 
     // Create a map for quick lookup of incoming tariffs
     const incomingMap = new Map();
-    const updatedTariffs = tariffs.map(tariff => {
-      const finalId = tariff.id || uuidv4();
 
-      let rate = parseFloat(tariff.cost) / netCost;
-      let freight = rate * netFreight;
-      let insurance = rate * netInsurance;
-      incomingMap.set(finalId, true);
-      return { ...tariff, id: finalId, freight: freight.toFixed(2), insurance: insurance.toFixed(2) };
-    });
+    let updatedTariffs;
+    if (netCost > 0) {
+      const costNums = tariffs.map(t => parseFloat(t.cost || 0));
+      const freightAlloc = allocateProportionalToCents(netFreight, costNums);
+      const insuranceAlloc = allocateProportionalToCents(netInsurance, costNums);
+
+      updatedTariffs = tariffs.map((tariff, idx) => {
+        const finalId = tariff.id || uuidv4();
+        incomingMap.set(finalId, true);
+        return { ...tariff, id: finalId, freight: freightAlloc[idx], insurance: insuranceAlloc[idx] };
+      });
+    } else {
+      // no valuation data -> zero freight/insurance
+      updatedTariffs = tariffs.map(tariff => {
+        const finalId = tariff.id || uuidv4();
+        incomingMap.set(finalId, true);
+        return { ...tariff, id: finalId, freight: '0.00', insurance: '0.00' };
+      });
+    }
 
     // Remove tariffs that are not in the incoming list
     declaration.items = (declaration.items || []).filter(t => incomingMap.has(t.id));
