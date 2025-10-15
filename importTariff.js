@@ -27,6 +27,7 @@ async function importTariffs() {
         code: row.code,
         description: row.description,
         duty: row.duty,
+        unit: row.unit
       });
     })
     .on('end', async () => {

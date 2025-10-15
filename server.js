@@ -616,21 +616,27 @@ function structureDataForXml(consolidatedItems, masterBill) {
             NetFreight: { _text: item.valuation.netFreight },
             TermsOfDelivery: { _text: "FOB" },
           },
-          Items: (item.items || []).map(tariff => ({
-            Code: { _text: tariff.code },
-            Desc: { _text: tariff.desc },
-            Origin: { _text: "USA" },
-            Qty: { _text: tariff.qty },
-            QtyUnit: { _text: "LB" },
-            Cost: { _text: tariff.cost },
-            Insurance: { _text: tariff.insurance },
-            Freight: { _text: tariff.freight },
-            InvNumber: { _text: tariff.invNumber },
-            Procedure: {
-              Code: { _text: "HOME" },
-              ImporterNumber: { _text: item.importer.number },
-            },
-          })),
+          Items: (item.items || []).map(tariff => {
+            // try to find tariff definition in DB by code and use its unit if present
+            const tariffDefs = (db.data.tariffs || []);
+            const tariffDef = tariffDefs.find(td => String(td.code) === String(tariff.code));
+            const qtyUnit = tariffDef?.unit || tariffDef?.qtyUnit || tariffDef?.QtyUnit || tariff.qtyUnit || 'LB';
+            return ({
+              Code: { _text: tariff.code },
+              Desc: { _text: tariff.desc },
+              Origin: { _text: "USA" },
+              Qty: { _text: tariff.qty },
+              QtyUnit: { _text: qtyUnit },
+              Cost: { _text: tariff.cost },
+              Insurance: { _text: tariff.insurance },
+              Freight: { _text: tariff.freight },
+              InvNumber: { _text: tariff.invNumber },
+              Procedure: {
+                Code: { _text: "HOME" },
+                ImporterNumber: { _text: item.importer.number },
+              },
+            });
+          }),
           MoneyDeclaredFlag: { _text: "N" },
         }))
       }
