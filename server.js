@@ -551,7 +551,7 @@ function structureDataForXml(consolidatedItems, masterBill) {
     SADEntry: {
       Date: { _text: new Date().toISOString().split('T')[0] },
       Regime: { _text: 'IM1' },
-      Importer: { Number: { _text: "20005264" } },
+      Importer: { Number: { _text: "20738450" } },
       Exporter: { Number: { _text: masterBill.exporter?.number || '' } },
       Finance: {},
       Consignment: {
@@ -632,7 +632,7 @@ function structureDataForXml(consolidatedItems, masterBill) {
               Freight: { _text: tariff.freight },
               InvNumber: { _text: tariff.invNumber },
               Procedure: {
-                Code: { _text: "HOME" },
+                Code: { _text: tariff.procedureCode },
                 ImporterNumber: { _text: item.importer.number },
               },
             });
