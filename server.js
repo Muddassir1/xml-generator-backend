@@ -70,14 +70,14 @@ app.get('/declarations', async (req, res) => {
   try {
     await db.read();
     const { transportMode } = req.query;
-    
+
     let filteredDeclarations = db.data.declarations;
     if (transportMode) {
-      filteredDeclarations = db.data.declarations.filter(declaration => 
+      filteredDeclarations = db.data.declarations.filter(declaration =>
         declaration.transportMode === transportMode
       );
     }
-    
+
     res.status(200).json(filteredDeclarations);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch declarations.' });
@@ -339,23 +339,23 @@ app.delete('/declarations/:id', async (req, res) => {
 app.delete('/declarations', async (req, res) => {
   try {
     const { ids } = req.body;
-    
+
     if (!ids || !Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: 'Please provide an array of declaration IDs to delete.' });
     }
 
     await db.read();
     const initialCount = db.data.declarations.length;
-    
+
     // Filter out the declarations with the provided IDs
     db.data.declarations = db.data.declarations.filter(d => !ids.includes(d.id));
-    
+
     const deletedCount = initialCount - db.data.declarations.length;
     await db.write();
-    
-    res.status(200).json({ 
+
+    res.status(200).json({
       message: `Successfully deleted ${deletedCount} declaration${deletedCount > 1 ? 's' : ''}.`,
-      deletedCount 
+      deletedCount
     });
   } catch (error) {
     console.error('Error deleting declarations:', error);
@@ -552,7 +552,15 @@ function structureDataForXml(consolidatedItems, masterBill) {
       Date: { _text: new Date().toISOString().split('T')[0] },
       Regime: { _text: 'IM1' },
       Importer: { Number: { _text: "20738450" } },
-      Exporter: { Number: { _text: masterBill.exporter?.number || '' } },
+      // Exporter: { Number: { _text: masterBill.exporter?.number || '' } },
+      Exporter: {
+        Name: { _text: "Novotrans" },
+        Address: { _text: "6371 NW 102nd Ave" },
+        City: { _text: "Doral" },
+        State: { _text: "FL" },
+        PostalCode: { _text: "33178" },
+        Country: { _text: "USA" },
+      },
       Finance: {},
       Consignment: {
         DepartureDate: { _text: masterBill.consignment?.departureDate || '' },
@@ -589,14 +597,14 @@ function structureDataForXml(consolidatedItems, masterBill) {
           Exporter: item.exporter?.number
             ? { Number: { _text: item.exporter.number } }
             : {
-                Name: { _text: item.exporter?.name || '' },
-                Address: { _text: item.exporter?.address || '' },
-                City: { _text: item.exporter?.city || '' },
-                State: { _text: item.exporter?.state || '' },
-                PostalCode: { _text: item.exporter?.postalcode || '' },
-                Country: { _text: item.exporter?.country || '' },
-                Phone: { _text: item.exporter?.phone || '' }
-              },
+              Name: { _text: item.exporter?.name || '' },
+              Address: { _text: item.exporter?.address || '' },
+              City: { _text: item.exporter?.city || '' },
+              State: { _text: item.exporter?.state || '' },
+              PostalCode: { _text: item.exporter?.postalcode || '' },
+              Country: { _text: item.exporter?.country || '' },
+              Phone: { _text: item.exporter?.phone || '' }
+            },
           Finance: {},
           BillNumber: { _text: item.billNumber },
           Packages: {
