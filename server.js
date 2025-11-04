@@ -312,8 +312,48 @@ app.put('/declarations/:id', async (req, res) => {
       updatedData.exporter.id = exporterId;
     }
 
-    const existingItems = db.data.declarations[declarationIndex].items;
-    db.data.declarations[declarationIndex] = { ...updatedData, id, items: existingItems };
+    const existingItems = db.data.declarations[declarationIndex].items || [];
+
+    // Determine which tariffs/items to process: prefer updatedData.items (if provided),
+    // otherwise operate on the existing items. This allows recalculation when valuation
+    // changes even if the items themselves weren't replaced in the request.
+    const incomingTariffs = Array.isArray(updatedData.items) ? updatedData.items : existingItems;
+
+    // Use valuation from the update if present, otherwise fall back to existing declaration valuation
+    const declarationValuation = updatedData.valuation || db.data.declarations[declarationIndex].valuation || {};
+    const netFreight = parseFloat(declarationValuation.netFreight || 0);
+    const netCost = parseFloat(declarationValuation.netCost || 0);
+    const netInsurance = parseFloat(declarationValuation.netInsurance || 0);
+
+    let processedTariffs = [];
+    if (Array.isArray(incomingTariffs) && incomingTariffs.length > 0) {
+      if (netCost > 0) {
+        const costNums = incomingTariffs.map(t => parseFloat(t.cost || 0));
+        const freightAlloc = allocateProportionalToCents(netFreight, costNums);
+        const insuranceAlloc = allocateProportionalToCents(netInsurance, costNums);
+
+        processedTariffs = incomingTariffs.map((tariff, idx) => ({
+          ...tariff,
+          id: tariff.id || uuidv4(),
+          freight: freightAlloc[idx],
+          insurance: insuranceAlloc[idx]
+        }));
+      } else {
+        // No valuation -> set freight/insurance to zero per-tariff
+        processedTariffs = incomingTariffs.map(tariff => ({
+          ...tariff,
+          id: tariff.id || uuidv4(),
+          freight: '0.00',
+          insurance: '0.00'
+        }));
+      }
+    } else {
+      // No tariffs at all: keep existing items as-is
+      processedTariffs = existingItems;
+    }
+
+    // Persist the updated declaration with recalculated items
+    db.data.declarations[declarationIndex] = { ...updatedData, id, items: processedTariffs };
 
     await db.write();
     res.status(200).json(db.data.declarations[declarationIndex]);
