@@ -19,10 +19,12 @@
   "dependencies": {
     "body-parser": "^1.20.2",
     "cors": "^2.8.5",
+    "csv-parse": "^6.1.0",
     "csv-parser": "^3.2.0",
     "express": "^4.19.2",
     "fs": "^0.0.1-security",
     "lowdb": "^7.0.1",
+    "multer": "^2.0.2",
     "nodemon": "^3.1.10",
     "uuid": "^9.0.1",
     "xml-js": "^1.6.11"

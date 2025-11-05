@@ -1,6 +1,9 @@
 // ----------------------------------------------------------------------
 // Dependencies
 // ----------------------------------------------------------------------
+import multer from 'multer';
+import { parse } from 'csv-parse';
+import fs from 'fs';
 import express from 'express';
 import bodyParser from 'body-parser';
 import cors from 'cors';
@@ -60,6 +63,9 @@ const app = express();
 const port = 3001;
 app.use(cors());
 app.use(bodyParser.json());
+
+// Set up multer for file upload
+const upload = multer({ dest: 'uploads/' });
 
 // ----------------------------------------------------------------------
 // API Endpoints for Declarations
@@ -711,6 +717,97 @@ function structureDataForXml(consolidatedItems, masterBill) {
 
   return sadEntryObject;
 }
+
+// ----------------------------------------------------------------------
+// CSV Upload Endpoint
+// ----------------------------------------------------------------------
+app.post('/declarations/upload-csv', upload.single('file'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded' });
+  }
+
+  const transportMode = req.body.transportMode;
+  if (!transportMode || !['AIR', 'OCEAN'].includes(transportMode)) {
+    return res.status(400).json({ error: 'Invalid transport mode' });
+  }
+
+  try {
+    const fileContent = fs.readFileSync(req.file.path);
+    const records = [];
+
+    // Parse CSV file
+    await new Promise((resolve, reject) => {
+      parse(fileContent, {
+        columns: true,
+        trim: true,
+        skip_empty_lines: true,
+      })
+        .on('data', (data) => records.push(data))
+        .on('end', resolve)
+        .on('error', reject);
+    });
+
+    // Process each record
+    await db.read();
+    let createdCount = 0;
+
+    for (const record of records) {
+      const declaration = {
+        id: uuidv4(),
+        transportMode,
+        billNumber: record.billNumber,
+        items: [],
+        importer: {
+          number: record.importerNumber,
+          name: record.importerName || '',
+        },
+        exporter: {
+          number: record.exporterNumber || '',
+          name: record.exporterName || '',
+          address: record.exporterAddress || '',
+          city: record.exporterCity || '',
+          state: record.exporterState || '',
+          postalcode: record.exporterPostalCode || '',
+          country: record.exporterCountry || '',
+          phone: record.exporterPhone || '',
+        },
+        packages: {
+          pkgCount: record.packageCount || '',
+          pkgType: record.packageType || '',
+          grossWt: record.grossWeight || '',
+          grossVol: record.grossVolume || '',
+          contents: record.contents || '',
+        },
+        valuation: {
+          netCost: record.netCost || '0.00',
+          netFreight: record.netFreight || '0.00',
+          netInsurance: record.netInsurance || '0.00',
+        }
+      };
+
+      db.data.declarations.push(declaration);
+      createdCount++;
+    }
+
+    await db.write();
+
+    // Clean up uploaded file
+    fs.unlinkSync(req.file.path);
+
+    res.status(200).json({
+      message: `Successfully created ${createdCount} declarations`,
+      createdCount
+    });
+
+  } catch (error) {
+    console.error('Error processing CSV:', error);
+    // Clean up uploaded file in case of error
+    if (req.file) {
+      fs.unlinkSync(req.file.path);
+    }
+    res.status(500).json({ error: 'Failed to process CSV file' });
+  }
+});
 
 // ----------------------------------------------------------------------
 // Start the Server
