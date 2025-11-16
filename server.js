@@ -43,6 +43,26 @@ function allocateProportionalToCents(totalAmount, weights) {
   return floorShares.map(c => (c / 100).toFixed(2));
 }
 
+/**
+ * Divide a monetary total equally across items using integer cents and largest-remainder method.
+ * Returns an array of strings formatted to two decimals (e.g. "12.34").
+ */
+function divideEquallyInCents(totalAmount, count) {
+  if (count === 0) return [];
+  
+  const totalCents = Math.round(Number(totalAmount) * 100);
+  const perItem = Math.floor(totalCents / count);
+  const remainder = totalCents % count;
+  
+  const shares = Array(count).fill(perItem);
+  // Distribute remaining cents to first items
+  for (let i = 0; i < remainder; i++) {
+    shares[i] += 1;
+  }
+  
+  return shares.map(c => (c / 100).toFixed(2));
+}
+
 // ----------------------------------------------------------------------
 // Database Setup
 // ----------------------------------------------------------------------
@@ -197,12 +217,15 @@ app.post('/declarations', async (req, res) => {
 
         newDeclaration.items = processedTariffs;
       } else {
-        // If no valuation data, just store the tariff without calculated freight/insurance
-        const processedTariffs = tariffs.map(tariff => ({
+        // If netCost is 0, divide freight and insurance equally among tariffs
+        const freightAlloc = divideEquallyInCents(netFreight, tariffs.length);
+        const insuranceAlloc = divideEquallyInCents(netInsurance, tariffs.length);
+
+        const processedTariffs = tariffs.map((tariff, idx) => ({
           ...tariff,
           id: tariff.id || uuidv4(),
-          freight: '0.00',
-          insurance: '0.00'
+          freight: freightAlloc[idx],
+          insurance: insuranceAlloc[idx]
         }));
         newDeclaration.items = processedTariffs;
       }
@@ -345,12 +368,15 @@ app.put('/declarations/:id', async (req, res) => {
           insurance: insuranceAlloc[idx]
         }));
       } else {
-        // No valuation -> set freight/insurance to zero per-tariff
-        processedTariffs = incomingTariffs.map(tariff => ({
+        // If netCost is 0, divide freight and insurance equally among tariffs
+        const freightAlloc = divideEquallyInCents(netFreight, incomingTariffs.length);
+        const insuranceAlloc = divideEquallyInCents(netInsurance, incomingTariffs.length);
+
+        processedTariffs = incomingTariffs.map((tariff, idx) => ({
           ...tariff,
           id: tariff.id || uuidv4(),
-          freight: '0.00',
-          insurance: '0.00'
+          freight: freightAlloc[idx],
+          insurance: insuranceAlloc[idx]
         }));
       }
     } else {
@@ -453,11 +479,14 @@ app.put('/declarations/:id/tariffs', async (req, res) => {
         return { ...tariff, id: finalId, freight: freightAlloc[idx], insurance: insuranceAlloc[idx] };
       });
     } else {
-      // no valuation data -> zero freight/insurance
-      updatedTariffs = tariffs.map(tariff => {
+      // If netCost is 0, divide freight and insurance equally among tariffs
+      const freightAlloc = divideEquallyInCents(netFreight, tariffs.length);
+      const insuranceAlloc = divideEquallyInCents(netInsurance, tariffs.length);
+
+      updatedTariffs = tariffs.map((tariff, idx) => {
         const finalId = tariff.id || uuidv4();
         incomingMap.set(finalId, true);
-        return { ...tariff, id: finalId, freight: '0.00', insurance: '0.00' };
+        return { ...tariff, id: finalId, freight: freightAlloc[idx], insurance: insuranceAlloc[idx] };
       });
     }
 
@@ -554,18 +583,33 @@ app.get('/master-bill', async (req, res) => {
 // XML Generation (reading from DB)
 // ----------------------------------------------------------------------
 app.post('/generate-xml', async (req, res) => {
-  const masterBill = req.body; // Expecting masterBill object
+  // Accept either `{ masterBill: {...}, selectedIds: [...] }` or legacy raw masterBill body
+  const requestBody = req.body || {};
+  const masterBill = requestBody.masterBill || requestBody;
+  const selectedIds = Array.isArray(requestBody.selectedIds)
+    ? requestBody.selectedIds
+    : (Array.isArray(requestBody.ids) ? requestBody.ids : []);
+
   try {
     await db.read();
-    const { declarations } = db.data;
+    const allDeclarations = db.data.declarations || [];
 
-    if (!declarations || declarations.length === 0) {
+    // If selectedIds provided, filter the declarations to only those IDs
+    let declarationsToUse = allDeclarations;
+    if (selectedIds && selectedIds.length > 0) {
+      declarationsToUse = allDeclarations.filter(d => selectedIds.includes(d.id));
+      if (!declarationsToUse || declarationsToUse.length === 0) {
+        return res.status(400).json({ error: 'No declarations match the selected IDs.' });
+      }
+    }
+
+    if (!declarationsToUse || declarationsToUse.length === 0) {
       return res.status(400).json({ error: 'No declarations in DB.' });
     }
 
     // Save master bill data to database (single object, not array)
     const masterBillEntry = {
-      id: uuidv4(), // You'll need to implement this function or use a library like uuid
+      id: uuidv4(),
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       ...masterBill
@@ -577,7 +621,7 @@ app.post('/generate-xml', async (req, res) => {
     // Write changes to the database
     await db.write();
 
-    const structuredJs = structureDataForXml(declarations, masterBill);
+    const structuredJs = structureDataForXml(declarationsToUse, masterBill);
     const xmlData = js2xml(structuredJs, { compact: true, spaces: 4 });
 
     res.header('Content-Type', 'application/xml');
