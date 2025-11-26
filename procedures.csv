@@ -1,0 +1,20 @@
+code,title
+HOME,Regular Import
+REEXPORT,Articles for Re-Export
+REIMPORT,Re-imported Articles
+COUR SHT SHIP,Short Shipped Import
+FNL LBL SHT SHIP,Short Shipped Import
+INBD SHT SHIP,Short Shipped Import
+SHORT SHIP,Short Shipped Import
+LBL DF WHSE,Liable: Consumption from Duty Free Warehouse
+LBL PRVT WHSE,Liable: Consumption from Private Warehouse
+LBL EDU,Liable: Education and Culture
+LBL ARCFTS,Liable: For Aircrafts
+LBL HLTH,Liable: For Health
+LBL IND,Liable: For Industries
+LBL SHIPS,Liable: For Shipping
+LBL AUCTN,Liable: Goods sold in Auction
+LBL TEMP IMP,Liable: Home use after Temp. admission
+LBL TNST,Liable: Home use from Transit or Transhipment
+LBL SHT SHIP,Liable: Home use from goods previously declared
+LBL TRSM,Liable: Tourism Purposes
