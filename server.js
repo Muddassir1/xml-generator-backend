@@ -793,17 +793,46 @@ app.post('/declarations/upload-csv', upload.single('file'), async (req, res) => 
 
     // Process each record
     await db.read();
+    await usersDb.read();
     let createdCount = 0;
 
     for (const record of records) {
+      // Ensure importer exists in users.json (match by name, case-insensitive)
+      const importerName = (record.importerName || '').trim();
+      const importerNumber = (record.importerNumber || '').trim();
+      let importerId = null;
+
+      if (importerName) {
+        const existingUser = usersDb.data.users.find(u => (u.name || '').trim().toLowerCase() === importerName.toLowerCase());
+        if (existingUser) {
+          // Update TIN if provided
+          if (importerNumber) {
+            existingUser.tin = importerNumber;
+            await usersDb.write();
+          }
+          importerId = existingUser.id;
+        } else {
+          // Create new importer user
+          const newUser = {
+            id: uuidv4(),
+            name: importerName,
+            tin: importerNumber || ''
+          };
+          usersDb.data.users.push(newUser);
+          await usersDb.write();
+          importerId = newUser.id;
+        }
+      }
+
+      // Build declaration object and attach importer id if available
       const declaration = {
         id: uuidv4(),
         transportMode,
         billNumber: record.billNumber,
         items: [],
         importer: {
-          number: record.importerNumber,
-          name: record.importerName || '',
+          number: importerNumber,
+          name: importerName || '',
         },
         exporter: {
           number: record.exporterNumber || '',
@@ -829,11 +858,75 @@ app.post('/declarations/upload-csv', upload.single('file'), async (req, res) => 
         }
       };
 
+      // Attach importer id to declaration if we have one
+      if (importerId) {
+        declaration.importer.id = importerId;
+      }
+
+      // Handle exporter: associate with importer when possible (mirrors POST /declarations behavior)
+      const exporterName = (record.exporterName || '').trim();
+      const exporterNumber = (record.exporterNumber || '').trim();
+      if (exporterName) {
+        let exporterId = null;
+
+        if (exporterNumber) {
+          const existingByTin = (db.data.exporters || []).find(e => e.tin === exporterNumber && e.uid === importerId);
+          if (existingByTin) {
+            // update basic fields
+            existingByTin.name = exporterName || existingByTin.name || '';
+            existingByTin.address = record.exporterAddress || existingByTin.address || '';
+            existingByTin.city = record.exporterCity || existingByTin.city || '';
+            existingByTin.state = record.exporterState || existingByTin.state || '';
+            existingByTin.postalcode = record.exporterPostalCode || existingByTin.postalcode || '';
+            existingByTin.country = record.exporterCountry || existingByTin.country || '';
+            existingByTin.phone = record.exporterPhone || existingByTin.phone || '';
+            exporterId = existingByTin.id;
+          } else {
+            const newExporter = {
+              id: uuidv4(),
+              name: exporterName || '',
+              tin: exporterNumber || '',
+              address: record.exporterAddress || '',
+              city: record.exporterCity || '',
+              state: record.exporterState || '',
+              postalcode: record.exporterPostalCode || '',
+              country: record.exporterCountry || '',
+              phone: record.exporterPhone || '',
+              uid: importerId || null
+            };
+            db.data.exporters.push(newExporter);
+            exporterId = newExporter.id;
+          }
+        } else {
+          // No TIN path: always create a new exporter linked to importer
+          const newExporter = {
+            id: uuidv4(),
+            name: exporterName || '',
+            tin: '',
+            address: record.exporterAddress || '',
+            city: record.exporterCity || '',
+            state: record.exporterState || '',
+            postalcode: record.exporterPostalCode || '',
+            country: record.exporterCountry || '',
+            phone: record.exporterPhone || '',
+            uid: importerId || null
+          };
+          db.data.exporters.push(newExporter);
+          exporterId = newExporter.id;
+        }
+
+        if (exporterId) {
+          declaration.exporter.id = exporterId;
+        }
+      }
+
       db.data.declarations.push(declaration);
       createdCount++;
     }
 
+    // Persist both DB files
     await db.write();
+    await usersDb.write();
 
     // Clean up uploaded file
     fs.unlinkSync(req.file.path);
