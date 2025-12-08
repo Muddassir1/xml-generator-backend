@@ -634,6 +634,148 @@ app.post('/generate-xml', async (req, res) => {
   }
 });
 
+// Generate HOUSE XML for a single declaration
+app.post('/generate-xml/house', async (req, res) => {
+  // Accept either `{ masterBill: {...}, declarationId: '...' }` or legacy raw masterBill with ids
+  const requestBody = req.body || {};
+  const masterBill = requestBody.masterBill || requestBody;
+  const declarationId = requestBody.declarationId || (Array.isArray(requestBody.selectedIds) && requestBody.selectedIds.length === 1 ? requestBody.selectedIds[0] : null);
+
+  if (!declarationId) {
+    return res.status(400).json({ error: 'Please provide a single declarationId.' });
+  }
+
+  try {
+    await db.read();
+    const declaration = (db.data.declarations || []).find(d => d.id === declarationId);
+    if (!declaration) {
+      return res.status(404).json({ error: 'Declaration not found.' });
+    }
+
+    // Save master bill data to database (single object, not array)
+    const masterBillEntry = {
+      id: uuidv4(),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      ...masterBill
+    };
+    db.data.masterBill = masterBillEntry;
+    await db.write();
+
+    const structuredJs = structureHouseDataForXml(declaration, masterBill);
+    const xmlData = js2xml(structuredJs, { compact: true, spaces: 4 });
+
+    res.header('Content-Type', 'application/xml');
+    res.header('Content-Disposition', 'attachment; filename="HOUSE_SADEntry.xml"');
+    res.status(200).send(xmlData);
+
+  } catch (error) {
+    console.error('HOUSE XML generation error:', error);
+    res.status(500).json({ error: 'An internal server error occurred.' });
+  }
+});
+
+function structureHouseDataForXml(item, masterBill) {
+  const mode = masterBill.consignment?.transportMode;
+  const sadEntryObject = {
+    _declaration: { _attributes: { version: '1.0', encoding: 'UTF-8' } },
+    SADEntry: {
+      Date: { _text: new Date().toISOString().split('T')[0] },
+      Regime: { _text: 'IM1' },
+      Importer: { Number: { _text: item.importer.number } },
+      Exporter: item.exporter?.number
+        ? { Number: { _text: item.exporter.number } }
+        : {
+          Name: { _text: item.exporter?.name || '' },
+          Address: { _text: item.exporter?.address || '' },
+          City: { _text: item.exporter?.city || '' },
+          State: { _text: item.exporter?.state || '' },
+          PostalCode: { _text: item.exporter?.postalcode || '' },
+          Country: { _text: item.exporter?.country || '' },
+          Phone: { _text: item.exporter?.phone || '' }
+        },
+      Finance: {},
+      Consignment: {
+        DepartureDate: { _text: masterBill.consignment?.departureDate || '' },
+        ArrivalDate: { _text: masterBill.consignment?.arrivalDate || '' },
+        ExportCountry: { _text: 'USA' },
+        ImportCountry: { _text: 'USA' },
+        ShippingPort: { _text: masterBill.consignment?.shippingPort || '' },
+        DischargePort: { _text: mode == 'SEA' ? 'KYGEC' : 'KYGCM' },
+        TransportMode: { _text: mode || '' },
+      },
+      Shipment: {
+        VesselCode: { _text: masterBill.shipment?.vesselCode || '' },
+        VoyageNo: { _text: masterBill.shipment?.voyageNo || '' },
+        ShippingAgent: { _text: masterBill.shipment?.shippingAgent || '' },
+        MasterBillNumber: { _text: masterBill.shipment?.billNumber || '' },
+        BillNumber: { _text: item.billNumber || '' },
+        BillType: { _text: 'HOUSE' },
+      },
+      Container: [],
+      Packages: {
+        PkgCount: { _text: item.packages?.pkgCount || '' },
+        PkgType: { _text: item.packages?.pkgType || '' },
+        GrossWt: { _text: item.packages?.grossWt || '' },
+        GrossWtUnit: { _text: 'LB' },
+        GrossVol: { _text: item.packages?.grossVol || '' },
+        GrossVolUnit: { _text: 'CF' },
+        Contents: { _text: item.packages?.contents || '' },
+        CategoryOfGoods: { _text: '1' },
+      },
+      MoneyDeclaredFlag: { _text: 'N' },
+      Valuation: {
+        Currency: { _text: 'USD' },
+        NetCost: { _text: item.valuation?.netCost || '' },
+        NetInsurance: { _text: item.valuation?.netInsurance || '' },
+        NetFreight: { _text: item.valuation?.netFreight || '' },
+        TermsOfDelivery: { _text: 'FOB' },
+      },
+      Items: (item.items || []).map(tariff => {
+        const tariffDefs = (db.data.tariffs || []);
+        const tariffDef = tariffDefs.find(td => String(td.code) === String(tariff.code));
+        const qtyUnit = tariffDef?.unit || tariffDef?.qtyUnit || tariffDef?.QtyUnit || tariff.qtyUnit || 'LB';
+        return ({
+          Code: { _text: tariff.code },
+          Desc: { _text: tariff.desc },
+          Origin: { _text: 'USA' },
+          Qty: { _text: tariff.qty },
+          QtyUnit: { _text: qtyUnit },
+          Cost: { _text: tariff.cost },
+          Insurance: { _text: tariff.insurance },
+          Freight: { _text: tariff.freight },
+          InvNumber: { _text: tariff.invNumber },
+          Procedure: {
+            Code: { _text: tariff.procedureCode },
+            ImporterNumber: { _text: item.importer.number },
+          },
+        });
+      }),
+      MoneyDeclaredFlag: { _text: 'N' },
+    }
+  };
+
+  // Populate Container array if masterBill provides containers
+  /* if (masterBill.containers && masterBill.containers.length > 0) {
+    masterBill.containers.forEach(container => {
+      const containerObject = {
+        ContainerNumber: { _text: container.containerNumber || '' },
+        ContainerType: { _text: container.containerType || '' },
+        SealNumber: { _text: container.sealNumber || '' },
+        DockReceipt: { _text: container.dockReceipt || '' },
+        MarksAndNumbers: { _text: container.marksNumbers || '' },
+        CubicSize: { _text: container.volume || '' },
+        CubicUnit: { _text: 'CF' },
+        GrossWt: { _text: container.weight || '' },
+        GrossWtUnit: { _text: 'LB' },
+      }
+      sadEntryObject.SADEntry.Container.push(containerObject);
+    });
+  } */
+
+  return sadEntryObject;
+}
+
 function structureDataForXml(consolidatedItems, masterBill) {
   const mode = masterBill.consignment?.transportMode;
   const sadEntryObject = {
