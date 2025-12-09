@@ -723,7 +723,6 @@ function structureHouseDataForXml(item, masterBill) {
         Contents: { _text: item.packages?.contents || '' },
         CategoryOfGoods: { _text: '1' },
       },
-      MoneyDeclaredFlag: { _text: 'N' },
       Valuation: {
         Currency: { _text: 'USD' },
         NetCost: { _text: item.valuation?.netCost || '' },
