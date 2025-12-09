@@ -708,9 +708,9 @@ function structureHouseDataForXml(item, masterBill) {
         VesselCode: { _text: masterBill.shipment?.vesselCode || '' },
         VoyageNo: { _text: masterBill.shipment?.voyageNo || '' },
         ShippingAgent: { _text: masterBill.shipment?.shippingAgent || '' },
-        MasterBillNumber: { _text: masterBill.shipment?.billNumber || '' },
         BillNumber: { _text: item.billNumber || '' },
         BillType: { _text: 'HOUSE' },
+        MasterBillNumber: { _text: masterBill.shipment?.billNumber || '' },
       },
       Container: [],
       Packages: {
