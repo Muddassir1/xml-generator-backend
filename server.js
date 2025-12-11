@@ -970,6 +970,7 @@ app.post('/declarations/upload-csv', upload.single('file'), async (req, res) => 
         id: uuidv4(),
         transportMode,
         billNumber: record.billNumber,
+        comment: record.comment || record.comments || '',
         items: [],
         importer: {
           number: importerNumber,
