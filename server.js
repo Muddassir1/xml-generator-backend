@@ -4,6 +4,8 @@
 import multer from 'multer';
 import { parse } from 'csv-parse';
 import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import express from 'express';
 import bodyParser from 'body-parser';
 import cors from 'cors';
@@ -11,6 +13,12 @@ import { js2xml } from 'xml-js';
 import { Low } from 'lowdb';
 import { JSONFile } from 'lowdb/node';
 import { v4 as uuidv4 } from 'uuid';
+import invoicePipeline from './invoice-pipeline.cjs';
+
+import tariffMatcher from './matchTariffs.cjs';
+
+const { processPdf } = invoicePipeline;
+const { matchItems } = tariffMatcher;
 
 /**
  * Allocate a monetary total (dollars) proportionally across weights (e.g. tariff costs)
@@ -87,6 +95,16 @@ app.use(bodyParser.json());
 // Set up multer for file upload
 const upload = multer({ dest: 'uploads/' });
 
+const invoiceUpload = multer({
+  dest: 'uploads/invoices/',
+  fileFilter: (req, file, callback) => {
+    if (path.extname(file.originalname).toLowerCase() !== '.pdf') {
+      return callback(new Error('Only PDF invoices are supported.'));
+    }
+    callback(null, true);
+  },
+});
+
 // ----------------------------------------------------------------------
 // API Endpoints for Declarations
 // ----------------------------------------------------------------------
@@ -121,6 +139,7 @@ app.post('/declarations', async (req, res) => {
 
     // Handle importer - check by TIN number
     let importerId;
+    const hasImporterDetails = Boolean(importer?.id || importer?.name || importer?.number);
     if (importer?.id) {
       // Existing importer - find by ID and update TIN
       const existingUser = usersDb.data.users.find(u => u.id === importer.id);
@@ -131,7 +150,7 @@ app.post('/declarations', async (req, res) => {
         importerId = existingUser.id;
         newDeclaration.importer.id = importerId;
       }
-    } else {
+    } else if (hasImporterDetails) {
       // New importer - create new user
       const newImporter = {
         id: uuidv4(),
@@ -145,7 +164,11 @@ app.post('/declarations', async (req, res) => {
     }
 
     // Handle exporter - associate with importer (supports with/without TIN)
-    if (importerId && exporter) {
+    const hasExporterDetails = Boolean(
+      exporter?.id || exporter?.name || exporter?.number || exporter?.address ||
+      exporter?.city || exporter?.state || exporter?.postalcode || exporter?.country || exporter?.phone
+    );
+    if (importerId && exporter && hasExporterDetails) {
       // If exporter has TIN, try to reuse by (tin + importerId)
       if (exporter.number) {
         const existingByTin = db.data.exporters.find(e => e.tin === exporter.number && e.uid === importerId);
@@ -1085,6 +1108,63 @@ app.post('/declarations/upload-csv', upload.single('file'), async (req, res) => 
       fs.unlinkSync(req.file.path);
     }
     res.status(500).json({ error: 'Failed to process CSV file' });
+  }
+});
+
+// ----------------------------------------------------------------------
+// Invoice Upload Endpoint
+// ----------------------------------------------------------------------
+app.post('/clients/:clientId/invoices', invoiceUpload.single('file'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No PDF invoice uploaded' });
+  }
+
+  const processingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'invoice-processing-'));
+
+  try {
+    const { orderRows, itemRows } = await processPdf(req.file.path, processingDir);
+
+    // Match every extracted line item to a tariff code. matchItems never rejects:
+    // a failed item comes back with matched_code null / confidence "low".
+    const matches = await matchItems(itemRows.map((row) => row.item_description));
+
+    const itemsByOrder = new Map();
+    itemRows.forEach((row, i) => {
+      const m = matches[i];
+      const item = {
+        description: row.item_description,
+        price: row.item_price,
+        tariff: {
+          code: m.matched_code,
+          description: m.description,
+          duty_rate: m.duty_rate,
+          unit: m.unit,
+          confidence: m.confidence,
+          reason: m.reason,
+          needs_review: m.matched_code === null || m.confidence !== 'high',
+        },
+      };
+      if (!itemsByOrder.has(row.order_index)) itemsByOrder.set(row.order_index, []);
+      itemsByOrder.get(row.order_index).push(item);
+    });
+
+    // Same shape as before (one entry per order), with an added `items` array.
+    const invoices = orderRows.map((order) => ({
+      ...order,
+      items: itemsByOrder.get(order.order_index) || [],
+    }));
+
+    res.status(200).json({
+      clientId: req.params.clientId,
+      sourceFile: req.file.originalname,
+      invoices,
+    });
+  } catch (error) {
+    console.error('Error processing invoice PDF:', error);
+    res.status(500).json({ error: 'Failed to process invoice PDF' });
+  } finally {
+    fs.rmSync(req.file.path, { force: true });
+    fs.rmSync(processingDir, { recursive: true, force: true });
   }
 });
 
