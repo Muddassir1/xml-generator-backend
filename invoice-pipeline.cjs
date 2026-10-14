@@ -18,6 +18,9 @@ const TESSERACT_COMMAND = resolveCommand('tesseract', [
 const AMOUNT_RE_G = /-?(?:USD|KYD)?\s?-?\d[\d,]*\.\d{2}/g;
 const ORDER_NUM_RE = /Order\s*#\s*([\d-]{10,})/i;
 
+// Set to true to print per-order cutoff diagnostics.
+const DEBUG_ITEMS = true;
+
 const LABEL_MAP = [
   [/item\(?s?\)?\s*subtotal/i, 'subtotal'],
   [/itern\(?s?\)?\s*subtotal/i, 'subtotal'],
@@ -146,12 +149,17 @@ async function findOrderSummaryCrop(imgPath, words) {
 
   const cropPath = imgPath.replace(/\.png$/, '_crop.png');
   await sharp(imgPath).extract({ left, top, width: cropWidth, height: cropHeight }).toFile(cropPath);
-  // bottomY is returned so item extraction can skip the summary box region.
-  return { cropPath, bottomY: Math.min(height, bottomY) };
+  // bottomY is returned as a fallback cutoff for item extraction.
+  // headerTop lets item extraction find the first "Delivered..." status line below the box.
+  return {
+    cropPath,
+    bottomY: Math.min(height, bottomY),
+    headerTop: topY,
+    hadGrand: grandWords.length > 0,
+  };
 }
 
 function parseCrop(cropPath) {
-  // Fixed: uses the resolved TESSERACT_COMMAND (V2 previously called bare 'tesseract' here).
   const text = execFileSync(TESSERACT_COMMAND, [cropPath, 'stdout', '--psm', '6']).toString().replace(/\r\n/g, '\n');
   const fields = {};
   for (const rawLine of text.split('\n')) {
@@ -224,6 +232,48 @@ const BOILERPLATE_LINE_RE = new RegExp([
 
 const STANDALONE_PRICE_RE = /^\$?-?\d[\d,]*\.\d{2}$/;
 
+// Items always begin at the first delivery-status line ("Delivered October 5",
+// "Arriving ...", etc.) below the summary box. Anchoring on that line is more
+// robust than "Grand Total top + 60px", which breaks if OCR misses "Grand".
+function findItemsStartY(words, headerTop) {
+  const hit = words
+    .filter((w) =>
+      /^(Delivered|Arriving|Shipped|Delivery|Now|Preparing|Not)$/i.test(w.text) &&
+      w.top > headerTop + 300
+    )
+    .sort((a, b) => a.top - b.top)[0];
+  return hit ? hit.top - 10 : null;
+}
+
+// Product thumbnails sit to the left of the item text and OCR often reads junk
+// from them ("q u) oO", "} ©", "hd", "aN."). Those junk words land at the same
+// height as the title/price and get merged into the line, which stops the price
+// from being recognised (the item is then silently dropped).
+// The item text column starts at the "Sold by:" / "Return or replace" lines, so
+// anything left of that column is thumbnail noise.
+function findItemColumnLeft(words) {
+  const anchors = words.filter((w) => /^(Sold|Supplied|Return)$/i.test(w.text));
+  if (!anchors.length) return null;
+  return Math.min(...anchors.map((w) => w.left)) - 25;
+}
+
+// Returns the numeric price if the line is a price on its own, allowing a few
+// short junk tokens (<= 3 chars) in front of it; otherwise null.
+function parsePriceLine(clean) {
+  if (STANDALONE_PRICE_RE.test(clean.replace(/\s+/g, ''))) {
+    return parseFloat(clean.replace(/[^\d.]/g, ''));
+  }
+  const tokens = clean.split(' ');
+  const last = tokens[tokens.length - 1];
+  if (
+    STANDALONE_PRICE_RE.test(last) &&
+    tokens.slice(0, -1).every((t) => t.length <= 3)
+  ) {
+    return parseFloat(last.replace(/[^\d.]/g, ''));
+  }
+  return null;
+}
+
 function groupWordsIntoLines(words) {
   const sorted = [...words].sort((a, b) => a.top - b.top || a.left - b.left);
   const lines = [];
@@ -240,7 +290,7 @@ function groupWordsIntoLines(words) {
   if (cur.length) lines.push(cur);
   return lines.map((line) => {
     line.sort((a, b) => a.left - b.left);
-    return { top: line[0].top, text: line.map((w) => w.text).join(' ').trim() };
+    return { top: line[0].top, text: line.map((w) => w.text).join(' ').trim(), words: line };
   });
 }
 
@@ -255,14 +305,22 @@ function extractItemsFromPageRange(pages) {
     if (page.excludeBelowTop !== undefined) {
       words = words.filter((w) => w.top >= page.excludeBelowTop);
     }
+    const colLeft = findItemColumnLeft(words);
     const lines = groupWordsIntoLines(words);
 
-    for (const { text } of lines) {
-      const clean = text.replace(/\s+/g, ' ').trim();
+    for (const line of lines) {
+      // Boilerplate is matched on the full line first (e.g. "It was handed
+      // directly to a receptionist..." starts left of the item column).
+      const fullText = line.text.replace(/\s+/g, ' ').trim();
+      if (BOILERPLATE_LINE_RE.test(fullText)) continue;
+
+      // Then strip thumbnail noise left of the item text column.
+      const kept = colLeft === null ? line.words : line.words.filter((w) => w.left >= colLeft);
+      const clean = kept.map((w) => w.text).join(' ').replace(/\s+/g, ' ').trim();
       if (!clean || clean.length <= 2) continue; // drop OCR noise like stray "-"
-      if (STANDALONE_PRICE_RE.test(clean.replace(/\s+/g, ''))) {
+      const priceNum = parsePriceLine(clean);
+      if (priceNum !== null) {
         if (titleBuffer.length) {
-          const priceNum = parseFloat(clean.replace(/[^\d.]/g, ''));
           items.push({
             description: titleBuffer.join(' ').replace(/\s+/g, ' ').trim(),
             price: priceNum,
@@ -299,7 +357,14 @@ async function processPdf(pdfPath, outputRoot) {
     const crop = await findOrderSummaryCrop(pages[i].imgPath, pages[i].words);
     if (crop) {
       const fields = parseCrop(crop.cropPath);
-      anchors.push({ pageIdx: i, fields, orderNum: currentOrderNum, bottomY: crop.bottomY });
+      anchors.push({
+        pageIdx: i,
+        fields,
+        orderNum: currentOrderNum,
+        bottomY: crop.bottomY,
+        headerTop: crop.headerTop,
+        hadGrand: crop.hadGrand,
+      });
       currentOrderNum = null;
     }
   }
@@ -314,11 +379,22 @@ async function processPdf(pdfPath, outputRoot) {
     const startIdx = anchor.pageIdx;
     const endIdx = (a + 1 < anchors.length) ? anchors[a + 1].pageIdx - 1 : pages.length - 1;
 
+    // Prefer the first "Delivered..." status line as the cutoff; fall back to
+    // the summary-box bottom if no status line is found.
+    const itemsStartY = findItemsStartY(pages[startIdx].words, anchor.headerTop) ?? anchor.bottomY;
+
+    if (DEBUG_ITEMS) {
+      console.log(
+        `[items] order ${a} page ${startIdx + 1}: bottomY=${anchor.bottomY} ` +
+        `hadGrand=${anchor.hadGrand} itemsStartY=${itemsStartY}`
+      );
+    }
+
     const pageSlice = [];
     for (let p = startIdx; p <= endIdx; p += 1) {
       pageSlice.push({
         words: pages[p].words,
-        excludeBelowTop: (p === startIdx) ? anchor.bottomY : undefined,
+        excludeBelowTop: (p === startIdx) ? itemsStartY : undefined,
       });
     }
 
