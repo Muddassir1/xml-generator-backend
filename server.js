@@ -605,6 +605,25 @@ app.get('/master-bill', async (req, res) => {
 // ----------------------------------------------------------------------
 // XML Generation (reading from DB)
 // ----------------------------------------------------------------------
+function replaceAmpersandsInXmlText(node) {
+  if (Array.isArray(node)) {
+    return node.map(replaceAmpersandsInXmlText);
+  }
+
+  if (node === null || typeof node !== 'object') {
+    return node;
+  }
+
+  return Object.fromEntries(
+    Object.entries(node).map(([key, value]) => [
+      key,
+      key === '_text' && typeof value === 'string'
+        ? value.replace(/&/g, 'and')
+        : replaceAmpersandsInXmlText(value),
+    ])
+  );
+}
+
 app.post('/generate-xml', async (req, res) => {
   // Accept either `{ masterBill: {...}, selectedIds: [...] }` or legacy raw masterBill body
   const requestBody = req.body || {};
@@ -645,7 +664,7 @@ app.post('/generate-xml', async (req, res) => {
     await db.write();
 
     const structuredJs = structureDataForXml(declarationsToUse, masterBill);
-    const xmlData = js2xml(structuredJs, { compact: true, spaces: 4 });
+    const xmlData = js2xml(replaceAmpersandsInXmlText(structuredJs), { compact: true, spaces: 4 });
 
     res.header('Content-Type', 'application/xml');
     res.header('Content-Disposition', 'attachment; filename="SADEntry.xml"');
@@ -686,7 +705,7 @@ app.post('/generate-xml/house', async (req, res) => {
     await db.write();
 
     const structuredJs = structureHouseDataForXml(declaration, masterBill);
-    const xmlData = js2xml(structuredJs, { compact: true, spaces: 4 });
+    const xmlData = js2xml(replaceAmpersandsInXmlText(structuredJs), { compact: true, spaces: 4 });
 
     res.header('Content-Type', 'application/xml');
     res.header('Content-Disposition', 'attachment; filename="HOUSE_SADEntry.xml"');
