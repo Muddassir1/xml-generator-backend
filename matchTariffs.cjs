@@ -26,7 +26,7 @@ const Anthropic = require("@anthropic-ai/sdk");
 
 // ---------- CONFIG ----------
 const TARIFFS_FILE = process.env.TARIFFS_FILE || path.join(__dirname, "tariffs.json");
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-5-5";
+const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5-5";
 const DEFAULT_CONCURRENCY = parseInt(process.env.TARIFF_MATCH_CONCURRENCY || "4", 10);
 const MAX_CANDIDATES = 60;
 

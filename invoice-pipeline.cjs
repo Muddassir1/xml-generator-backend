@@ -1,25 +1,88 @@
 /**
- * Invoice Net-Total + Line-Item Extraction Pipeline.
- * Requires the system binaries pdftoppm and tesseract, plus sharp.
+ * Invoice extraction pipeline using local PDF text/OCR and Anthropic LLM.
+ *
+ * Requires the system binaries pdftoppm, pdftotext (both ship with poppler) and
+ * tesseract, plus sharp.
+ *
+ * Per page, the pipeline picks one of two sources:
+ *   - "text": the PDF has a real text layer. Words and positions come from
+ *             `pdftotext -bbox`, no rendering and no OCR (fast and exact).
+ *   - "ocr":  scanned / image-only page. The page is rendered with pdftoppm and
+ *             read with tesseract (slow, only used when needed).
+ * Both sources produce the same word shape ({ text, left, top, ... } in 300 DPI
+ * pixel coordinates), so all layout logic below is shared.
+ *
+ * Everything is async: nothing here blocks the Node event loop.
  */
 
 const fs = require('fs');
+const fsp = fs.promises;
+const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const sharp = require('sharp');
 
+
+const execFileAsync = promisify(execFile);
+
+// Load a local .env file without overriding variables already supplied by the environment.
+function loadEnvFile(file) {
+  if (!fs.existsSync(file)) return;
+  for (const raw of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq === -1) continue;
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (process.env[key] === undefined) process.env[key] = value;
+  }
+}
+
+loadEnvFile(path.join(__dirname, '.env'));
+
 const DPI = 300;
+// Low-resolution render used only to classify scanned pages (cheap OCR probe).
+const PROBE_DPI = 150;
+// SHEIN order numbers look like GSU183400001EW3 / GSU17V30Q000BBW.
+const SHEIN_ORDER_ID_RE = /\bGS[A-Z0-9]{10,}\b/;
+// SHEIN orders per LLM request (keeps each response far below the output limit).
+const ORDERS_PER_REQUEST = 15;
+// LLM requests in flight at once.
+const LLM_CONCURRENCY = 2;
+const MAX_OUTPUT_TOKENS = 16384;
+const PT_TO_PX = DPI / 72; // pdftotext reports PDF points (1/72 inch)
+
 const PDF_TO_IMAGE_COMMAND = resolveCommand('pdftoppm', [
   'C:\\Program Files\\poppler-26.09.0\\Library\\bin\\pdftoppm.exe',
 ]);
 const TESSERACT_COMMAND = resolveCommand('tesseract', [
   'C:\\Users\\muddassir\\AppData\\Local\\Programs\\Tesseract-OCR\\tesseract.exe',
 ]);
+// Optional: if pdftotext is missing, every page simply goes through OCR.
+const PDF_TO_TEXT_COMMAND = resolveOptionalCommand('pdftotext', [
+  path.join(path.dirname(PDF_TO_IMAGE_COMMAND), 'pdftotext.exe'),
+  'C:\\Program Files\\poppler-26.09.0\\Library\\bin\\pdftotext.exe',
+]);
+
 const AMOUNT_RE_G = /-?(?:USD|KYD)?\s?-?\d[\d,]*\.\d{2}/g;
 const ORDER_NUM_RE = /Order\s*#\s*([\d-]{10,})/i;
 
 // Set to true to print per-order cutoff diagnostics.
-const DEBUG_ITEMS = true;
+const DEBUG_ITEMS = false;
+
+// Pages with fewer words than this are treated as scans and sent to OCR.
+const MIN_TEXT_WORDS = 20;
+// Pages processed in parallel (each OCR job is CPU heavy, so keep this small).
+const DEFAULT_CONCURRENCY = Math.max(1, Math.min(4, os.cpus().length - 1));
+const MAX_BUFFER = 1024 * 1024 * 200;
+// Tesseract is multi-threaded by itself; limit it so parallel jobs don't oversubscribe the CPU.
+const TESSERACT_ENV = { ...process.env, OMP_THREAD_LIMIT: '1' };
 
 const LABEL_MAP = [
   [/item\(?s?\)?\s*subtotal/i, 'subtotal'],
@@ -59,6 +122,15 @@ function resolveCommand(command, knownPaths) {
   return resolvedPath;
 }
 
+function resolveOptionalCommand(command, knownPaths) {
+  try {
+    return resolveCommand(command, knownPaths);
+  } catch (err) {
+    console.warn(`[pipeline] ${err.message} Text-layer extraction disabled; all pages will use OCR.`);
+    return null;
+  }
+}
+
 function normLabel(rawLabel) {
   const key = rawLabel.toLowerCase().replace(/collected/g, '').trim();
   for (const [re, canon] of LABEL_MAP) {
@@ -67,24 +139,130 @@ function normLabel(rawLabel) {
   return null;
 }
 
-function pdfToImages(pdfPath, outPrefix) {
-  fs.mkdirSync(path.dirname(outPrefix), { recursive: true });
-  execFileSync(PDF_TO_IMAGE_COMMAND, ['-png', '-r', String(DPI), pdfPath, outPrefix]);
-  const dir = path.dirname(outPrefix);
-  const base = path.basename(outPrefix);
-  return fs.readdirSync(dir)
-    .filter((fileName) => fileName.startsWith(base) && fileName.endsWith('.png') && !fileName.endsWith('_crop.png'))
-    .sort()
-    .map((fileName) => path.join(dir, fileName));
+// Runs fn(item, index) over items with at most `limit` running at once.
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const i = next;
+      next += 1;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
-function getWordsTSV(imgPath) {
-  const raw = execFileSync(TESSERACT_COMMAND, [imgPath, 'stdout', 'tsv'], {
-    maxBuffer: 1024 * 1024 * 50,
-  }).toString();
+// =====================================================================
+// Page sources: text layer (pdftotext) and OCR (pdftoppm + tesseract)
+// =====================================================================
+
+function decodeEntities(text) {
+  return text
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+const BBOX_PAGE_RE = /<page width="([\d.]+)" height="([\d.]+)">([\s\S]*?)<\/page>/g;
+const BBOX_WORD_RE = /<word xMin="(-?[\d.]+)" yMin="(-?[\d.]+)" xMax="(-?[\d.]+)" yMax="(-?[\d.]+)">([\s\S]*?)<\/word>/g;
+
+// Converts `pdftotext -bbox` output into the same word shape tesseract produces,
+// scaled from PDF points to 300 DPI pixels so every pixel threshold below keeps working.
+function parseBbox(html) {
+  const pages = [];
+  for (const pageMatch of html.matchAll(BBOX_PAGE_RE)) {
+    const words = [];
+    for (const m of pageMatch[3].matchAll(BBOX_WORD_RE)) {
+      const text = decodeEntities(m[5]).trim();
+      if (!text) continue;
+      const xMin = parseFloat(m[1]);
+      const yMin = parseFloat(m[2]);
+      const xMax = parseFloat(m[3]);
+      const yMax = parseFloat(m[4]);
+      words.push({
+        text,
+        left: Math.round(xMin * PT_TO_PX),
+        top: Math.round(yMin * PT_TO_PX),
+        width: Math.round((xMax - xMin) * PT_TO_PX),
+        height: Math.round((yMax - yMin) * PT_TO_PX),
+      });
+    }
+    pages.push({
+      words,
+      width: Math.round(parseFloat(pageMatch[1]) * PT_TO_PX),
+      height: Math.round(parseFloat(pageMatch[2]) * PT_TO_PX),
+    });
+  }
+  return pages;
+}
+
+// Returns one { words, width, height } per PDF page, or null if pdftotext is
+// unavailable or fails (callers then fall back to OCR for everything).
+async function getTextLayerPages(pdfPath) {
+  if (!PDF_TO_TEXT_COMMAND) return null;
+  try {
+    const { stdout } = await execFileAsync(
+      PDF_TO_TEXT_COMMAND,
+      ['-bbox', '-enc', 'UTF-8', pdfPath, '-'],
+      { maxBuffer: MAX_BUFFER, encoding: 'utf8' }
+    );
+    const pages = parseBbox(stdout);
+    return pages.length ? pages : null;
+  } catch (err) {
+    console.warn(`[pdftotext] failed for ${path.basename(pdfPath)}, falling back to OCR: ${err.message}`);
+    return null;
+  }
+}
+
+// A page counts as digital only if it has enough words and they look like real
+// text (broken font encodings produce pages full of symbols or replacement chars).
+function hasUsableText(words) {
+  if (words.length < MIN_TEXT_WORDS) return false;
+  const readable = words.filter((w) => /[A-Za-z0-9]/.test(w.text) && !w.text.includes('\uFFFD')).length;
+  return readable / words.length >= 0.8;
+}
+
+async function renderPageImage(pdfPath, pageNumber, workdir, dpi = DPI, tag = 'pg') {
+  const prefix = path.join(workdir, `${tag}-${pageNumber}`);
+  await execFileAsync(PDF_TO_IMAGE_COMMAND, [
+    '-png', '-r', String(dpi),
+    '-f', String(pageNumber), '-l', String(pageNumber),
+    '-singlefile', pdfPath, prefix,
+  ]);
+  return `${prefix}.png`;
+}
+
+// Fallback when pdftotext is unavailable: render every page (at `dpi`).
+async function renderAllPageImages(pdfPath, workdir, dpi = DPI, tag = 'pg') {
+  const prefix = path.join(workdir, tag);
+  await execFileAsync(PDF_TO_IMAGE_COMMAND, ['-png', '-r', String(dpi), pdfPath, prefix]);
+  const base = path.basename(prefix);
+  return (await fsp.readdir(workdir))
+    .filter((fileName) => fileName.startsWith(`${base}-`) && fileName.endsWith('.png') && !/_(crop|price_\d+)\.png$/.test(fileName))
+    .sort()
+    .map((fileName) => path.join(workdir, fileName));
+}
+
+async function getWordsTSV(imgPath) {
+  // --psm 11 (sparse text) instead of the default page-layout analysis: with
+  // product thumbnails next to the item text, the default mode treats whole
+  // text blocks as part of the picture and skips them (entire items vanish).
+  // Words are regrouped into lines by coordinates, so reading order is irrelevant.
+  const { stdout } = await execFileAsync(TESSERACT_COMMAND, [imgPath, 'stdout', '--psm', '11', 'tsv'], {
+    maxBuffer: MAX_BUFFER,
+    encoding: 'utf8',
+    env: TESSERACT_ENV,
+  });
   // Tesseract on Windows emits CRLF, which can leave a trailing carriage return
   // on the final TSV header and prevent the text column from being read.
-  const output = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const output = stdout.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   const lines = output.trim().split('\n');
   const header = lines[0].split('\t');
   const words = [];
@@ -99,16 +277,224 @@ function getWordsTSV(imgPath) {
     ['left', 'top', 'width', 'height', 'block_num', 'par_num', 'line_num'].forEach((key) => {
       row[key] = parseInt(row[key], 10);
     });
+    row.conf = parseFloat(row.conf);
+    if (row.conf < 10) continue; // pure OCR junk (thumbnail artefacts, clipped glyphs)
     words.push(row);
   }
   return words;
 }
 
+// OCR sometimes garbles a price sitting right under the "Return or replace
+// items" line (e.g. "$7.99" read as "*7°°"). For every item whose price line
+// is missing, re-read just the strip under that line as a single line of
+// digits and, if it parses, put the clean price back into the word list.
+async function rescueMissingPrices(imgPath, words, pageHeight, pageWidth) {
+  const colLeft = findItemColumnLeft(words);
+  if (colLeft === null) return;
+  const keptText = (line) => line.words.filter((w) => w.left >= colLeft).map((w) => w.text).join(' ').replace(/\s+/g, ' ').trim();
+  const lines = groupWordsIntoLines(words);
+
+  for (const anchor of lines.filter((l) => /^Return\b/i.test(keptText(l)))) {
+    const hasPrice = lines.some((l) =>
+      l.top > anchor.top + 20 && l.top < anchor.top + 110 && parsePriceLine(keptText(l)) !== null
+    );
+    if (hasPrice) continue;
+
+    const y0 = anchor.top + 38;
+    const y1 = Math.min(pageHeight, anchor.top + 105);
+    const x0 = Math.max(0, colLeft - 5);
+    if (y1 - y0 < 30) continue; // item is cut off by the page edge; price is on the next page
+    const cropPath = imgPath.replace(/\.png$/, `_price_${anchor.top}.png`);
+    try {
+      await sharp(imgPath)
+        .extract({ left: x0, top: y0, width: Math.min(600, pageWidth - x0), height: y1 - y0 })
+        .grayscale()
+        .normalise()
+        .toFile(cropPath);
+      const { stdout } = await execFileAsync(TESSERACT_COMMAND, [
+        cropPath, 'stdout', '--psm', '7', '-c', 'tessedit_char_whitelist=$0123456789.,',
+      ], { maxBuffer: MAX_BUFFER, encoding: 'utf8', env: TESSERACT_ENV });
+      const m = /(\d[\d,]*\.\d{2})/.exec(stdout.replace(/\s+/g, ''));
+      if (!m) continue;
+      for (let i = words.length - 1; i >= 0; i -= 1) {
+        if (words[i].top > anchor.top + 25 && words[i].top < anchor.top + 110 && words[i].left >= colLeft - 5) {
+          words.splice(i, 1);
+        }
+      }
+      words.push({
+        text: `$${m[1]}`, left: colLeft, top: anchor.top + 46, width: 120, height: 35, conf: 100,
+      });
+    } catch (err) {
+      console.warn(`[ocr] price rescue failed near y=${anchor.top}: ${err.message}`);
+    }
+  }
+}
+
+async function ocrPage(imgPath) {
+  const [words, meta] = await Promise.all([getWordsTSV(imgPath), sharp(imgPath).metadata()]);
+  await rescueMissingPrices(imgPath, words, meta.height, meta.width);
+  return { source: 'ocr', imgPath, words, width: meta.width, height: meta.height };
+}
+
+// Plain reading-order text of a word list (used for classification only).
+function wordsToText(words) {
+  return groupWordsIntoLines(words).map((line) => line.text).join('\n');
+}
+
+// Cheap OCR used only to classify a scanned page (low DPI, text only, no price rescue).
+async function probeOcrText(imgPath) {
+  const words = await getWordsTSV(imgPath);
+  return wordsToText(words);
+}
+
+// Loads the pages of the PDF as { source, words, width, height, pageNumber, imgPath? }.
+//
+// Pipeline:
+//   1. Read the text layer of every page (free). Pages with real text need no OCR.
+//   2. Scanned pages get a cheap low-DPI OCR probe, just enough to classify them.
+//   3. If the document is a SHEIN invoice, only the order-detail pages are kept,
+//      and only those are OCR'd at full resolution.
+//      Otherwise every page is loaded (original behaviour).
+// Returns { pages, totalPages, vendor }.
+async function loadPages(pdfPath, workdir, concurrency) {
+  await fsp.mkdir(workdir, { recursive: true });
+  const textLayer = await getTextLayerPages(pdfPath);
+
+  // slots[i] = { pageNumber, textPage?, probeText? }
+  let slots;
+  if (textLayer) {
+    slots = textLayer.map((textPage, i) => ({
+      pageNumber: i + 1,
+      textPage: hasUsableText(textPage.words) ? textPage : null,
+    }));
+  } else {
+    // No text layer at all: render low-res images of every page to count and probe them.
+    const probeImages = await renderAllPageImages(pdfPath, workdir, PROBE_DPI, 'probe');
+    slots = probeImages.map((imgPath, i) => ({ pageNumber: i + 1, textPage: null, probeImg: imgPath }));
+  }
+
+  // Probe the pages that have no usable text layer.
+  await mapLimit(slots.filter((s) => !s.textPage), concurrency, async (slot) => {
+    const imgPath = slot.probeImg || await renderPageImage(pdfPath, slot.pageNumber, workdir, PROBE_DPI, 'probe');
+    slot.probeText = await probeOcrText(imgPath);
+  });
+
+  const pageText = (slot) => (slot.textPage ? wordsToText(slot.textPage.words) : slot.probeText || '');
+  slots.forEach((slot) => { slot.text = pageText(slot); });
+
+  const isShein = detectShein(slots.map((s) => s.text));
+  const selected = isShein ? slots.filter((s) => isSheinOrderPage(s.text)) : slots;
+
+  // If detection was positive but no page matched, don't risk dropping everything.
+  const toLoad = selected.length ? selected : slots;
+  const vendor = isShein && selected.length ? 'SHEIN' : null;
+
+  const pages = await mapLimit(toLoad, concurrency, async (slot) => {
+    if (slot.textPage) {
+      return {
+        source: 'text',
+        words: slot.textPage.words,
+        width: slot.textPage.width,
+        height: slot.textPage.height,
+        pageNumber: slot.pageNumber,
+      };
+    }
+    const imgPath = await renderPageImage(pdfPath, slot.pageNumber, workdir);
+    const ocr = await ocrPage(imgPath);
+    return { ...ocr, pageNumber: slot.pageNumber };
+  });
+
+  return { pages, totalPages: slots.length, vendor };
+}
+
+// =====================================================================
+// SHEIN invoices
+//
+// A SHEIN "order details" printout is one browser page per order, followed by
+// "You May Also Like" product grids and the site footer. Those extra pages
+// carry no invoice data but make up most of the file (and most of the tokens).
+// =====================================================================
+
+// A page that holds order data: the order header/table, or the totals block
+// that spills onto the next page when an order is long.
+function isSheinOrderPage(text) {
+  const hasTitle = /ORDER\s+DETAILS/i.test(text);
+  const hasOrderNo = /Order\s*NO\b/i.test(text) || SHEIN_ORDER_ID_RE.test(text);
+  const hasTable = /Products\s+Quantity\s+SKU\s+Amount/i.test(text);
+  const hasTotals = /Subtotal\s*:/i.test(text) && /Shipping\s*Fee/i.test(text);
+  return (hasTitle && hasOrderNo) || hasTable || hasTotals;
+}
+
+// The document is SHEIN if it has order-detail pages and SHEIN branding somewhere.
+function detectShein(texts) {
+  const joined = texts.join('\n');
+  return /SHEIN/i.test(joined) && texts.some((t) => isSheinOrderPage(t));
+}
+
+// Lines that never matter for extraction (promo banners, buttons, legal boilerplate).
+const SHEIN_NOISE_LINE_RE = /^(back|copy|subscribe|track|review|received|\(?combine\)? return)$|Benefit will only|Delivery Service\]|Force Majeure|circumstance beyond|joint shipment/i;
+
+// Reduces a SHEIN order page to the part that matters: the order number/date,
+// the item table, and the price breakdown. The account sidebar, top navigation,
+// billing/shipping/seller blocks and footer are dropped.
+function sheinOrderText(page) {
+  const words = page.words;
+
+  // Sidebar: when the "Personal Center" menu is present, the content column starts
+  // at the left edge of "Logistics" / "Products" / "Have been delivered".
+  const hasSidebar = words.some((w) => /^Personal$/i.test(w.text)) && words.some((w) => /^Center$/i.test(w.text));
+  let contentLeft = 0;
+  if (hasSidebar) {
+    const anchors = words.filter((w) => /^(Logistics|Products|Have|Order)$/i.test(w.text) && w.left > page.width * 0.2);
+    contentLeft = anchors.length ? Math.min(...anchors.map((w) => w.left)) - 15 : Math.floor(page.width * 0.3);
+  }
+
+  // Top: start at the "ORDER DETAILS" title (skips header bar and breadcrumb).
+  const titleWord = words
+    .filter((w) => /^ORDER$/i.test(w.text) && w.left >= contentLeft)
+    .find((w) => words.some((x) => /^DETAILS$/i.test(x.text) && Math.abs(x.top - w.top) < Y_TOL && x.left > w.left));
+  const startTop = titleWord ? titleWord.top - 5 : 0;
+
+  // Bottom: everything from the "Subscription" block down is billing/shipping/seller/footer.
+  const subWord = words
+    .filter((w) => /^Subscription$/i.test(w.text) && w.top > startTop)
+    .sort((a, b) => a.top - b.top)[0];
+  const endTop = subWord ? subWord.top - 5 : Infinity;
+
+  const kept = words.filter((w) => w.top >= startTop && w.top < endTop && w.left >= contentLeft);
+  return groupWordsIntoLines(kept)
+    .map((line) => line.text)
+    .filter((t) => t && !SHEIN_NOISE_LINE_RE.test(t.trim()))
+    .join('\n');
+}
+
+// Groups the kept pages into orders: a page that shows an order number starts a
+// new order; pages without one (a spilled totals block) belong to the previous order.
+function groupSheinOrders(pages) {
+  const groups = [];
+  for (const page of pages) {
+    const text = wordsToText(page.words);
+    const startsOrder = /Order\s*NO\b/i.test(text) || SHEIN_ORDER_ID_RE.test(text);
+    if (startsOrder || !groups.length) {
+      groups.push({ pageNumbers: [page.pageNumber], text: sheinOrderText(page) });
+    } else {
+      const g = groups[groups.length - 1];
+      g.pageNumbers.push(page.pageNumber);
+      g.text += `\n${sheinOrderText(page)}`;
+    }
+  }
+  return groups;
+}
+
+// =====================================================================
+// Order summary box
+// =====================================================================
+
 const Y_TOL = 40;
 
-async function findOrderSummaryCrop(imgPath, words) {
-  const meta = await sharp(imgPath).metadata();
-  const { width, height } = meta;
+// Pure layout logic (works on either word source). Finds the
+// "Ship to ... Order Summary" header row and returns the box region to read.
+function locateSummaryRegion(words, width, height) {
   const orderWords = words.filter((word) => word.text === 'Order');
   const summaryWords = words.filter((word) => word.text === 'Summary');
   let headerWord = null;
@@ -147,20 +533,42 @@ async function findOrderSummaryCrop(imgPath, words) {
   const cropHeight = Math.min(height, bottomY) - top;
   if (cropWidth <= 0 || cropHeight <= 0) return null;
 
-  const cropPath = imgPath.replace(/\.png$/, '_crop.png');
-  await sharp(imgPath).extract({ left, top, width: cropWidth, height: cropHeight }).toFile(cropPath);
   // bottomY is returned as a fallback cutoff for item extraction.
   // headerTop lets item extraction find the first "Delivered..." status line below the box.
   return {
-    cropPath,
+    left,
+    top,
+    width: cropWidth,
+    height: cropHeight,
     bottomY: Math.min(height, bottomY),
     headerTop: topY,
     hadGrand: grandWords.length > 0,
   };
 }
 
-function parseCrop(cropPath) {
-  const text = execFileSync(TESSERACT_COMMAND, [cropPath, 'stdout', '--psm', '6']).toString().replace(/\r\n/g, '\n');
+// Text-layer pages: the summary text is just the words inside the region.
+function summaryTextFromWords(words, region) {
+  const inRegion = words.filter((w) =>
+    w.top >= region.top && w.top < region.top + region.height && w.left >= region.left
+  );
+  return groupWordsIntoLines(inRegion).map((line) => line.text).join('\n');
+}
+
+// OCR pages: crop the box out of the image and read it as a block of lines.
+async function summaryTextFromImage(imgPath, region) {
+  const cropPath = imgPath.replace(/\.png$/, '_crop.png');
+  await sharp(imgPath)
+    .extract({ left: region.left, top: region.top, width: region.width, height: region.height })
+    .toFile(cropPath);
+  const { stdout } = await execFileAsync(TESSERACT_COMMAND, [cropPath, 'stdout', '--psm', '6'], {
+    maxBuffer: MAX_BUFFER,
+    encoding: 'utf8',
+    env: TESSERACT_ENV,
+  });
+  return stdout.replace(/\r\n/g, '\n');
+}
+
+function parseSummaryText(text) {
   const fields = {};
   for (const rawLine of text.split('\n')) {
     const line = rawLine.trim();
@@ -227,7 +635,10 @@ const BOILERPLATE_LINE_RE = new RegExp([
   'Privacy Notice|Consumer Health|Your Ads|English|United States|Help|amazon',
   'Ship to|Payment method|Order Summary|Order placed|Grand Total',
   'Item\\(?s?\\)? Subtotal|Shipping ?& ?Handling|Estimated tax|Total before tax',
-  'Print|©|http|Exchange rate|1 USD)',
+  'Print|©|http|Exchange rate|1 USD',
+  // Browser print headers/footers: "10/5/26, 3:42 PM ..." and page counters like "2/3".
+  '\\d{1,2}\\/\\d{1,2}\\/\\d{2,4},?\\s+\\d{1,2}:\\d{2}',
+  '\\d{1,2}\\s?\\/\\s?\\d{1,2}$)',
 ].join('|'), 'i');
 
 const STANDALONE_PRICE_RE = /^\$?-?\d[\d,]*\.\d{2}$/;
@@ -274,31 +685,65 @@ function parsePriceLine(clean) {
   return null;
 }
 
+// Words join a line when their vertical centre is within 18px of the line's
+// average centre. Comparing to the line average (not to the previous word) stops
+// stray junk fragments from chaining two neighbouring lines together, and using
+// the centre instead of the top edge keeps tall glyphs ("$", capitals) and
+// x-height-only words on the same line.
 function groupWordsIntoLines(words) {
-  const sorted = [...words].sort((a, b) => a.top - b.top || a.left - b.left);
+  const center = (w) => w.top + (w.height || 0) / 2;
+  const sorted = [...words].sort((a, b) => center(a) - center(b) || a.left - b.left);
   const lines = [];
   let cur = [];
-  let lastTop = null;
+  let sum = 0;
   for (const w of sorted) {
-    if (lastTop !== null && Math.abs(w.top - lastTop) > 18) {
+    const c = center(w);
+    if (cur.length && Math.abs(c - sum / cur.length) > 18) {
       lines.push(cur);
       cur = [];
+      sum = 0;
     }
     cur.push(w);
-    lastTop = w.top;
+    sum += c;
   }
   if (cur.length) lines.push(cur);
   return lines.map((line) => {
     line.sort((a, b) => a.left - b.left);
-    return { top: line[0].top, text: line.map((w) => w.text).join(' ').trim(), words: line };
+    // Median (not min) so a stray junk fragment can't drag the line's position.
+    const tops = line.map((w) => w.top).sort((a, b) => a - b);
+    return {
+      top: tops[Math.floor(tops.length / 2)],
+      text: line.map((w) => w.text).join(' ').trim(),
+      words: line,
+    };
   });
 }
 
 // pages: array of { words, excludeBelowTop? } for the page range belonging to one order.
 // excludeBelowTop (on the first page only) skips the order-summary header box region.
+// A title buffer is carried across page breaks, so an item whose title is at the
+// bottom of one page and price at the top of the next is still joined. If the
+// range ends while a title has no price (item cut off), it is returned with
+// price: null and incomplete: true instead of being silently dropped.
 function extractItemsFromPageRange(pages) {
   const items = [];
   let titleBuffer = [];
+  // Item layout is: title lines -> "Sold by:" -> (return info) -> price. Once
+  // "Sold by:" has been seen, only the price can follow; anything else is noise
+  // (typically half-clipped text lines at the edge of a screenshot page).
+  let sawSoldBy = false;
+
+  const flushIncomplete = () => {
+    if (titleBuffer.length) {
+      items.push({
+        description: titleBuffer.join(' ').replace(/\s+/g, ' ').trim(),
+        price: null,
+        incomplete: true,
+      });
+    }
+    titleBuffer = [];
+    sawSoldBy = false;
+  };
 
   for (const page of pages) {
     let words = page.words;
@@ -309,115 +754,309 @@ function extractItemsFromPageRange(pages) {
     const lines = groupWordsIntoLines(words);
 
     for (const line of lines) {
-      // Boilerplate is matched on the full line first (e.g. "It was handed
-      // directly to a receptionist..." starts left of the item column).
-      const fullText = line.text.replace(/\s+/g, ' ').trim();
-      if (BOILERPLATE_LINE_RE.test(fullText)) continue;
-
-      // Then strip thumbnail noise left of the item text column.
+      // Strip thumbnail noise left of the item text column.
       const kept = colLeft === null ? line.words : line.words.filter((w) => w.left >= colLeft);
       const clean = kept.map((w) => w.text).join(' ').replace(/\s+/g, ' ').trim();
+      // Boilerplate is matched on the full line too (e.g. "It was handed
+      // directly to a receptionist..." starts left of the item column).
+      const fullText = line.text.replace(/\s+/g, ' ').trim();
+
+      if (BOILERPLATE_LINE_RE.test(fullText) || BOILERPLATE_LINE_RE.test(clean)) {
+        if (/^(Sold|Supplied) by/i.test(clean) || /^(Sold|Supplied) by/i.test(fullText)) sawSoldBy = true;
+        // A new delivery block can't start in the middle of an item: a title
+        // still waiting for its price here means the price was never read.
+        if (/^(Delivered|Arriving)/i.test(fullText)) flushIncomplete();
+        continue;
+      }
       if (!clean || clean.length <= 2) continue; // drop OCR noise like stray "-"
+
       const priceNum = parsePriceLine(clean);
       if (priceNum !== null) {
         if (titleBuffer.length) {
           items.push({
             description: titleBuffer.join(' ').replace(/\s+/g, ' ').trim(),
             price: priceNum,
+            incomplete: false,
           });
           titleBuffer = [];
         }
+        sawSoldBy = false;
         continue;
       }
-      if (BOILERPLATE_LINE_RE.test(clean)) continue;
+
+      const conf = lineConf(kept);
+      if (conf < 40) continue; // garbled / clipped text, not a real title line
+
+      if (sawSoldBy) {
+        // Between "Sold by:" and the price. Low-confidence text is clipped-line
+        // noise. A clean, confident line means the next item's title has started
+        // because this item's price was never read, so close it as incomplete.
+        if (conf < 85 || clean.length < 12) continue;
+        flushIncomplete();
+      }
       titleBuffer.push(clean);
     }
   }
+
+  flushIncomplete();
   return items;
+}
+
+// Mean OCR confidence of a line's words (text-layer words have none -> 100).
+function lineConf(words) {
+  const confs = words.map((w) => w.conf).filter((c) => typeof c === 'number' && !Number.isNaN(c));
+  return confs.length ? confs.reduce((a, b) => a + b, 0) / confs.length : 100;
+}
+
+// =====================================================================
+// LLM extraction (batched, with retries and automatic splitting on truncation)
+// =====================================================================
+
+const BASE_PROMPT = `Extract invoice/order details from the supplied text. The document may contain multiple orders; return one object per order. Do not guess missing values: use null. Include every purchased item. For each item return description, quantity, unit_price, line_total, and source_text. unit_price is the price of one unit; line_total only when explicitly printed as a line total. Also return order_number, order_date, currency, subtotal, shipping, discount (positive number), tax, and grand_total. Return ONLY valid JSON with this shape:
+{"vendor":string|null,"orders":[{"order_number":string|null,"order_date":string|null,"currency":string|null,"items":[{"description":string,"quantity":number|null,"unit_price":number|null,"line_total":number|null,"source_text":string}],"subtotal":number|null,"shipping":number|null,"discount":number|null,"tax":number|null,"grand_total":number|null}],"warnings":string[]}`;
+
+const SHEIN_PROMPT_NOTES = `
+This is a SHEIN "Order Details" printout. Each "=== ORDER ===" block below is exactly ONE order; return exactly one object per block, in the same order.
+- order_number is the code starting with "GS" (e.g. GSU17V30Q000BBW), shown under "Order NO."; order_date is the value under "Date".
+- Items are in the table with columns Products / Quantity / SKU / Amount / Status. The product title can wrap over several lines and ends with the variant (e.g. "Hot Pink / L"); include it in the description.
+- The Amount column shows two prices for the item: the price charged and the struck-through original retail price. The text order of the two can be swapped (especially in OCR text), so the LOWER one is the charged price; use it as unit_price and never use the retail price.
+- Text may come from OCR: in order numbers, letters O/Q and digit 0 are easily confused, so keep the order number exactly as printed.
+- Under the table: Retail Price, Subtotal, Shipping Fee, On-Time Delivery Guarantee, Discount (coupon, shown as a negative), Sales Tax, Total. Map Total to grand_total, Sales Tax to tax, Shipping Fee to shipping ("FREE" means 0). Return the discount as a positive number.
+- currency is USD unless stated otherwise.
+- Keep source_text short (the product title as printed, max 120 characters).`;
+
+async function callAnthropic(prompt, { apiKey, model, signal }) {
+  const maxAttempts = 5;
+  for (let attempt = 1; ; attempt += 1) {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: MAX_OUTPUT_TOKENS,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+      signal,
+    });
+
+    if (response.ok) return response.json();
+
+    const retryable = response.status === 429 || response.status === 529 || response.status >= 500;
+    if (retryable && attempt < maxAttempts) {
+      const retryAfter = parseFloat(response.headers.get('retry-after'));
+      const delayMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : Math.min(30000, 1000 * 2 ** attempt);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      continue;
+    }
+    const detail = await response.text().catch(() => '');
+    throw new Error(`Anthropic API ${response.status}: ${detail.slice(0, 1500)}`);
+  }
+}
+
+function parseModelJson(raw) {
+  let cleaned = raw.replace(/^```json\s*/i, '').replace(/\s*```$/, '').trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // Tolerate stray prose around the JSON object.
+    const start = cleaned.indexOf('{');
+    const end = cleaned.lastIndexOf('}');
+    if (start !== -1 && end > start) cleaned = cleaned.slice(start, end + 1);
+    return JSON.parse(cleaned);
+  }
+}
+
+// groups: [{ pageNumbers, text }]. Returns { orders, warnings }.
+// If the answer is cut off (max_tokens) the batch is split in half and retried.
+async function extractBatchAdaptive(groups, llmOptions) {
+  const body = llmOptions.shein
+    ? groups.map((g, i) => `=== ORDER ${i + 1} (pages ${g.pageNumbers.join(', ')}) ===\n${g.text}`).join('\n\n')
+    : groups.map((g) => g.text).join('\n\n');
+  const prompt = `${BASE_PROMPT}${llmOptions.shein ? `\n${SHEIN_PROMPT_NOTES}` : ''}\n\nInvoice text:\n${body}`;
+
+  const result = await callAnthropic(prompt, llmOptions);
+  const raw = (result.content || []).filter((part) => part.type === 'text').map((part) => part.text).join('');
+
+  let data = null;
+  if (result.stop_reason !== 'max_tokens') {
+    try {
+      data = parseModelJson(raw);
+    } catch {
+      data = null;
+    }
+  }
+
+  if (!data || !Array.isArray(data.orders)) {
+    if (groups.length > 1) {
+      const mid = Math.ceil(groups.length / 2);
+      const [a, b] = await Promise.all([
+        extractBatchAdaptive(groups.slice(0, mid), llmOptions),
+        extractBatchAdaptive(groups.slice(mid), llmOptions),
+      ]);
+      return { orders: [...a.orders, ...b.orders], warnings: [...a.warnings, ...b.warnings] };
+    }
+    if (result.stop_reason === 'max_tokens') {
+      throw new Error('Anthropic response was truncated (max_tokens) even for a single batch.');
+    }
+    throw new Error(`Anthropic returned invalid JSON: ${raw.slice(0, 1000)}`);
+  }
+
+  const warnings = Array.isArray(data.warnings) ? [...data.warnings] : [];
+  // One group = one order for SHEIN; when counts line up, remember which pages each order came from.
+  const orders = data.orders.map((order, i) => ({
+    ...order,
+    __pages: llmOptions.shein && data.orders.length === groups.length ? groups[i].pageNumbers.join(',') : null,
+  }));
+  if (llmOptions.shein && data.orders.length !== groups.length) {
+    warnings.push(`Expected ${groups.length} orders for pages ${groups[0].pageNumbers[0]}-${groups[groups.length - 1].pageNumbers.slice(-1)[0]} but got ${data.orders.length}; please review.`);
+  }
+  return { orders, warnings };
 }
 
 // =====================================================================
 
-async function processPdf(pdfPath, outputRoot) {
+// Reads everything needed from one page: where the summary box is (if any),
+// the parsed summary fields, and the order number mentioned on the page.
+async function analyzePage(page) {
+  const region = locateSummaryRegion(page.words, page.width, page.height);
+  let fields = null;
+  if (region) {
+    const summaryText = page.source === 'text'
+      ? summaryTextFromWords(page.words, region)
+      : await summaryTextFromImage(page.imgPath, region);
+    fields = parseSummaryText(summaryText);
+  }
+  const fullText = page.words.map((w) => w.text).join(' ');
+  return { ...page, region, fields, orderNumber: getOrderNumber(fullText) };
+}
+
+/**
+ * @param {string} pdfPath
+ * @param {string} outputRoot  Scratch images (OCR pages only) go in <outputRoot>/_page_images/<name>.
+ * @param {{ concurrency?: number, keepImages?: boolean }} [options]
+ * @returns {Promise<{ orderRows: object[], itemRows: object[], warnings: string[], pageSources: string[] }>}
+ */
+async function processPdf(pdfPath, outputRoot, options = {}) {
+  const { concurrency = DEFAULT_CONCURRENCY, keepImages = false } = options;
   const name = path.basename(pdfPath, '.pdf');
   const workdir = path.join(outputRoot, '_page_images', name);
-  const images = pdfToImages(pdfPath, path.join(workdir, 'pg'));
+  const warnings = [];
 
-  // Pass 1: OCR every page once and locate each order's anchor page
-  // (the page carrying its Ship-to / Order Summary / Grand Total box).
-  const pages = images.map((imgPath) => ({ imgPath, words: getWordsTSV(imgPath) }));
-  const anchors = [];
-  let currentOrderNum = null;
+  try {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    console.log(apiKey)
+    if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not set. Add it to your environment or .env file.');
 
-  for (let i = 0; i < pages.length; i += 1) {
-    const fullText = pages[i].words.map((w) => w.text).join(' ');
-    const orderNumber = getOrderNumber(fullText);
-    if (orderNumber) currentOrderNum = orderNumber;
+    const { pages: loaded, totalPages, vendor } = await loadPages(pdfPath, workdir, concurrency);
+    const pageSources = loaded.map((p) => p.source);
 
-    const crop = await findOrderSummaryCrop(pages[i].imgPath, pages[i].words);
-    if (crop) {
-      const fields = parseCrop(crop.cropPath);
-      anchors.push({
-        pageIdx: i,
-        fields,
-        orderNum: currentOrderNum,
-        bottomY: crop.bottomY,
-        headerTop: crop.headerTop,
-        hadGrand: crop.hadGrand,
-      });
-      currentOrderNum = null;
-    }
-  }
-
-  const orderRows = [];
-  const itemRows = [];
-
-  // Pass 2: an order's items run from below its summary box on the anchor page
-  // through the page before the next anchor.
-  for (let a = 0; a < anchors.length; a += 1) {
-    const anchor = anchors[a];
-    const startIdx = anchor.pageIdx;
-    const endIdx = (a + 1 < anchors.length) ? anchors[a + 1].pageIdx - 1 : pages.length - 1;
-
-    // Prefer the first "Delivered..." status line as the cutoff; fall back to
-    // the summary-box bottom if no status line is found.
-    const itemsStartY = findItemsStartY(pages[startIdx].words, anchor.headerTop) ?? anchor.bottomY;
-
-    if (DEBUG_ITEMS) {
-      console.log(
-        `[items] order ${a} page ${startIdx + 1}: bottomY=${anchor.bottomY} ` +
-        `hadGrand=${anchor.hadGrand} itemsStartY=${itemsStartY}`
+    // Build the units of work. SHEIN: one group per order, trimmed to the useful
+    // lines, sent in batches. Anything else: all pages in a single request (as before).
+    let batches;
+    if (vendor === 'SHEIN') {
+      const groups = groupSheinOrders(loaded);
+      batches = [];
+      for (let i = 0; i < groups.length; i += ORDERS_PER_REQUEST) {
+        batches.push(groups.slice(i, i + ORDERS_PER_REQUEST));
+      }
+      warnings.push(
+        `SHEIN invoice detected: sent ${loaded.length} of ${totalPages} pages (${groups.length} orders) to the LLM in ${batches.length} request(s).`
       );
+    } else {
+      const text = loaded.map((page) =>
+        `=== PAGE ${page.pageNumber} ===\n${wordsToText(page.words)}`
+      ).join('\n\n');
+      batches = [[{ pageNumbers: loaded.map((p) => p.pageNumber), text }]];
     }
 
-    const pageSlice = [];
-    for (let p = startIdx; p <= endIdx; p += 1) {
-      pageSlice.push({
-        words: pages[p].words,
-        excludeBelowTop: (p === startIdx) ? itemsStartY : undefined,
+    const model = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
+    const llmOptions = { apiKey, model, signal: options.signal, shein: vendor === 'SHEIN' };
+    const batchResults = await mapLimit(batches, LLM_CONCURRENCY, (batch) => extractBatchAdaptive(batch, llmOptions));
+
+    const allOrders = [];
+    for (const res of batchResults) {
+      allOrders.push(...res.orders);
+      warnings.push(...res.warnings);
+    }
+    const data = { orders: allOrders };
+    const orderRows = [];
+    const itemRows = [];
+
+    data.orders.forEach((order, index) => {
+      const fields = {
+        subtotal: order.subtotal,
+        shipping: order.shipping,
+        discount: order.discount,
+        tax: order.tax,
+        grand_total: order.grand_total,
+        currency: order.currency,
+      };
+      const netTotals = computeNetTotal(fields);
+      const items = Array.isArray(order.items) ? order.items : [];
+      const reviewFlags = [];
+      if (order.subtotal == null) reviewFlags.push('summary_not_parsed');
+      if (!order.order_number) reviewFlags.push('order_number_missing');
+      if (!items.length) reviewFlags.push('no_items_found');
+      if (items.some((item) => item.unit_price == null && item.line_total == null)) {
+        reviewFlags.push('items_missing_price');
+      }
+
+      const itemsSum = round2(items.reduce((sum, item) => {
+        const amount = typeof item.line_total === 'number'
+          ? item.line_total
+          : typeof item.unit_price === 'number'
+            ? item.unit_price * (typeof item.quantity === 'number' ? item.quantity : 1)
+            : 0;
+        return sum + amount;
+      }, 0));
+
+      if (typeof order.subtotal === 'number' && items.length && Math.abs(itemsSum - order.subtotal) > 0.01) {
+        reviewFlags.push('items_sum_differs_from_subtotal');
+      }
+
+      orderRows.push({
+        order_index: index,
+        source_file: path.basename(pdfPath),
+        order_number: order.order_number || null,
+        order_date: order.order_date || null,
+        pages: order.__pages || 'all',
+        ...netTotals,
+        items_sum: itemsSum,
+        needs_review: reviewFlags.length > 0,
+        review_flags: reviewFlags.join('; '),
       });
-    }
 
-    orderRows.push({
-      order_index: a,
-      source_file: path.basename(pdfPath),
-      order_number: anchor.orderNum,
-      pages: `pg-${startIdx + 1}..pg-${endIdx + 1}`,
-      ...computeNetTotal(anchor.fields),
+      items.forEach((item) => {
+        const price = typeof item.line_total === 'number'
+          ? item.line_total
+          : typeof item.unit_price === 'number'
+            ? item.unit_price
+            : null;
+        itemRows.push({
+          order_index: index,
+          source_file: path.basename(pdfPath),
+          order_number: order.order_number || null,
+          item_description: item.description || '',
+          item_price: price,
+          item_quantity: item.quantity ?? null,
+          item_unit_price: item.unit_price ?? null,
+          item_line_total: item.line_total ?? null,
+          item_source_text: item.source_text || '',
+          item_incomplete: price === null,
+        });
+      });
     });
 
-    for (const item of extractItemsFromPageRange(pageSlice)) {
-      itemRows.push({
-        order_index: a,
-        source_file: path.basename(pdfPath),
-        order_number: anchor.orderNum,
-        item_description: item.description,
-        item_price: item.price,
-      });
+    return { orderRows, itemRows, warnings, pageSources, totalPages, pagesSent: loaded.length, vendor };
+  } finally {
+    if (!keepImages) {
+      await fsp.rm(workdir, { recursive: true, force: true }).catch(() => {});
     }
   }
-
-  return { orderRows, itemRows };
 }
 
 module.exports = { processPdf };

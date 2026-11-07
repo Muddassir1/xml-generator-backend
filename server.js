@@ -1133,6 +1133,20 @@ app.post('/declarations/upload-csv', upload.single('file'), async (req, res) => 
 // ----------------------------------------------------------------------
 // Invoice Upload Endpoint
 // ----------------------------------------------------------------------
+// One-line reason an item needs review, or '' if it's fine.
+function itemReviewNote(row, m) {
+  const clip = (t) => String(t || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+  const issues = [];
+  if (row.item_incomplete) issues.push('no price found');
+  if (m.matched_code == null) {
+    issues.push(`no tariff match (${clip(m.reason) || 'unknown reason'})`);
+  } else {
+    if (m.confidence !== 'high') issues.push(`${m.confidence} confidence tariff match: ${clip(m.reason)}`);
+    if (m.duty_rate == null) issues.push('matched tariff has no duty rate');
+  }
+  return issues.join('; ');
+}
+
 app.post('/clients/:clientId/invoices', invoiceUpload.single('file'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No PDF invoice uploaded' });
@@ -1142,17 +1156,17 @@ app.post('/clients/:clientId/invoices', invoiceUpload.single('file'), async (req
 
   try {
     const { orderRows, itemRows } = await processPdf(req.file.path, processingDir);
-
-    // Match every extracted line item to a tariff code. matchItems never rejects:
-    // a failed item comes back with matched_code null / confidence "low".
     const matches = await matchItems(itemRows.map((row) => row.item_description));
 
     const itemsByOrder = new Map();
     itemRows.forEach((row, i) => {
       const m = matches[i];
+      const note = itemReviewNote(row, m);
       const item = {
         description: row.item_description,
         price: row.item_price,
+        needs_review: note !== '',
+        review_note: note,
         tariff: {
           code: m.matched_code,
           description: m.description,
@@ -1167,11 +1181,18 @@ app.post('/clients/:clientId/invoices', invoiceUpload.single('file'), async (req
       itemsByOrder.get(row.order_index).push(item);
     });
 
-    // Same shape as before (one entry per order), with an added `items` array.
-    const invoices = orderRows.map((order) => ({
-      ...order,
-      items: itemsByOrder.get(order.order_index) || [],
-    }));
+    const invoices = orderRows.map((order) => {
+      const items = itemsByOrder.get(order.order_index) || [];
+      const hasFlaggedItem = items.some((it) => it.needs_review);
+      const flags = order.review_flags ? order.review_flags.split('; ') : [];
+      if (hasFlaggedItem && !flags.includes('items_need_review')) flags.push('items_need_review');
+      return {
+        ...order,
+        needs_review: order.needs_review || hasFlaggedItem,
+        review_flags: flags.join('; '),
+        items,
+      };
+    });
 
     res.status(200).json({
       clientId: req.params.clientId,
