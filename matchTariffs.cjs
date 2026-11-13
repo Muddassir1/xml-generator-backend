@@ -275,21 +275,37 @@ async function matchItemUncached(itemText) {
   const candidates = keywordSearch(terms, entries);
   const result = await finalMatch(itemText, candidates);
 
-  let code = result.matched_code ?? null;
-  let confidence = result.confidence || "unknown";
+  // Normalize the model's code: treat null / "null" / "" / "none" as no match.
+  let code = result.matched_code;
+  if (code === undefined || code === null) {
+    code = null;
+  } else {
+    code = String(code).trim();
+    if (code === "" || /^(null|none|n\/a)$/i.test(code)) code = null;
+  }
+
+  let confidence = String(result.confidence || "unknown").toLowerCase();
   let reason = result.reason || "";
 
   // Guard against hallucinated codes: the answer must be one of the candidates we sent.
-  if (code !== null && !candidates.some((c) => c.code === String(code))) {
+  if (code !== null && !candidates.some((c) => c.code === code)) {
     reason = `Model returned a code not in the candidate list (${code}). ${reason}`.trim();
     code = null;
-    confidence = "low";
   }
 
-  const entry = code !== null ? byCode.get(String(code)) : null;
+  // Invariant: no code => low confidence, regardless of what the model said.
+  if (code === null) {
+    confidence = "low";
+    if (!reason) reason = "No suitable tariff code found - needs manual classification.";
+  }
+
+  // Also normalize unexpected confidence values.
+  if (!["high", "medium", "low"].includes(confidence)) confidence = "low";
+
+  const entry = code !== null ? byCode.get(code) : null;
   return {
     matched_code: code,
-    description: entry ? entry.description : result.description || "",
+    description: entry ? entry.description : "",
     duty_rate: entry ? entry.duty : null,
     unit: entry ? entry.unit ?? null : null,
     confidence,

@@ -1165,6 +1165,7 @@ app.post('/clients/:clientId/invoices', invoiceUpload.single('file'), async (req
       const item = {
         description: row.item_description,
         price: row.item_price,
+        quantity: row.item_quantity,
         needs_review: note !== '',
         review_note: note,
         tariff: {
@@ -1197,6 +1198,7 @@ app.post('/clients/:clientId/invoices', invoiceUpload.single('file'), async (req
     res.status(200).json({
       clientId: req.params.clientId,
       sourceFile: req.file.originalname,
+      vendors: [...new Set(invoices.map((inv) => inv.vendor).filter(Boolean))],
       invoices,
     });
   } catch (error) {

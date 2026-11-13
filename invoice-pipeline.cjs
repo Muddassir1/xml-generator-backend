@@ -76,6 +76,9 @@ const ORDER_NUM_RE = /Order\s*#\s*([\d-]{10,})/i;
 // Set to true to print per-order cutoff diagnostics.
 const DEBUG_ITEMS = false;
 
+// Max length of the short item description written to the output.
+const MAX_DESC_LEN = 50;
+
 // Pages with fewer words than this are treated as scans and sent to OCR.
 const MIN_TEXT_WORDS = 20;
 // Pages processed in parallel (each OCR job is CPU heavy, so keep this small).
@@ -153,6 +156,42 @@ async function mapLimit(items, limit, fn) {
   });
   await Promise.all(workers);
   return results;
+}
+
+// =====================================================================
+// Short item descriptions
+//
+// The model returns the pieces (short_name + variant); the code assembles the
+// final string so the 50-character cap is exact and the variant is never cut.
+// =====================================================================
+
+const hasRealText = (s) => /[A-Za-z0-9]{2,}/.test(String(s || ''));
+const squash = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+
+// Cuts at a word boundary, no ellipsis.
+function trimToWords(text, max) {
+  const clean = squash(text);
+  if (clean.length <= max) return clean;
+  const cut = clean.slice(0, max);
+  const lastSpace = cut.lastIndexOf(' ');
+  const base = lastSpace > max * 0.5 ? cut.slice(0, lastSpace) : cut;
+  return base.replace(/[\s,;:\-/|(]+$/, '');
+}
+
+// "<short name> - <variant>", always <= MAX_DESC_LEN chars. The name is trimmed first, never the variant.
+function pickDescription(item) {
+  const name = hasRealText(item.short_name) ? squash(item.short_name)
+    : hasRealText(item.description) ? squash(item.description)
+    : squash(item.source_text);
+  let variant = hasRealText(item.variant) ? trimToWords(item.variant, 22) : '';
+
+  if (!variant) return trimToWords(name, MAX_DESC_LEN);
+  const nameBudget = MAX_DESC_LEN - variant.length - 3; // " - "
+  if (nameBudget < 12) { // variant too long, keep the name readable
+    variant = trimToWords(variant, 12);
+    return `${trimToWords(name, MAX_DESC_LEN - variant.length - 3)} - ${variant}`;
+  }
+  return `${trimToWords(name, nameBudget)} - ${variant}`;
 }
 
 // =====================================================================
@@ -382,12 +421,18 @@ async function loadPages(pdfPath, workdir, concurrency) {
   const pageText = (slot) => (slot.textPage ? wordsToText(slot.textPage.words) : slot.probeText || '');
   slots.forEach((slot) => { slot.text = pageText(slot); });
 
-  const isShein = detectShein(slots.map((s) => s.text));
-  const selected = isShein ? slots.filter((s) => isSheinOrderPage(s.text)) : slots;
-
-  // If detection was positive but no page matched, don't risk dropping everything.
-  const toLoad = selected.length ? selected : slots;
-  const vendor = isShein && selected.length ? 'SHEIN' : null;
+  // Merged PDFs (several vendors' order emails printed into one file) are split
+  // into one segment per vendor first; SHEIN trimming then applies per segment, so a
+  // SHEIN email inside a merged file can't cause the other vendors' pages to be dropped.
+  // A normal single-vendor PDF yields exactly one segment (original behaviour).
+  const segmentsPlan = splitIntoVendorSegments(slots).map((seg) => {
+    const isShein = detectShein(seg.slots.map((s) => s.text));
+    const selected = isShein ? seg.slots.filter((s) => isSheinOrderPage(s.text)) : seg.slots;
+    // If detection was positive but no page matched, don't risk dropping everything.
+    const toLoad = selected.length ? selected : seg.slots;
+    return { vendorHint: seg.vendorHint, shein: isShein && selected.length > 0, slots: toLoad };
+  });
+  const toLoad = segmentsPlan.flatMap((seg) => seg.slots);
 
   const pages = await mapLimit(toLoad, concurrency, async (slot) => {
     if (slot.textPage) {
@@ -404,7 +449,71 @@ async function loadPages(pdfPath, workdir, concurrency) {
     return { ...ocr, pageNumber: slot.pageNumber };
   });
 
-  return { pages, totalPages: slots.length, vendor };
+  const pageByNumber = new Map(pages.map((p) => [p.pageNumber, p]));
+  const segments = segmentsPlan.map((seg) => ({
+    vendorHint: seg.vendorHint,
+    shein: seg.shein,
+    pages: seg.slots.map((slot) => pageByNumber.get(slot.pageNumber)),
+  }));
+
+  return { pages, totalPages: slots.length, segments };
+}
+
+// =====================================================================
+// Merged invoices (several vendors in one PDF)
+//
+// Typical case: order-confirmation emails from different stores printed from a
+// mail client and merged into one PDF. Each email's first page carries a sender
+// line with a date ("Zeelool <hello@news.zeelool.com>   Sat, Oct 17 at 2:13 PM");
+// the continuation pages do not. That line marks where a new vendor's document
+// starts, so each vendor can be extracted on its own instead of asking the LLM to
+// untangle everything in one request.
+// =====================================================================
+
+const EMAIL_SENDER_LINE_RE = new RegExp(
+  '^(.{1,80}?)\\s*<[^<>\\s]+@[^<>\\s]+>\\s+' +
+  '(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\\s+[A-Za-z]{3,9}\\s+\\d{1,2}' + // "Sat, Oct 17 at 2:13 PM"
+  '|[A-Za-z]{3,9}\\s+\\d{1,2},\\s+\\d{4}' +                                    // "Oct 17, 2026, 2:13 PM"
+  '|\\d{1,2}\\/\\d{1,2}\\/\\d{2,4})',                                          // "10/17/2026"
+  'i'
+);
+
+// Display name of the sender if the top of the page has an "email start" line, else null.
+function emailSenderOf(text) {
+  for (const line of String(text || '').split('\n').slice(0, 15)) {
+    const m = EMAIL_SENDER_LINE_RE.exec(line.trim());
+    if (m) return m[1].replace(/["']/g, '').trim() || null;
+  }
+  return null;
+}
+
+// Splits the pages into one segment per vendor. Returns [{ vendorHint, slots }].
+// Fewer than two detected document starts means "not a merged file": everything
+// stays in one segment. Several emails from the same sender (e.g. order + shipping
+// confirmation) are kept together so one order isn't extracted twice.
+function splitIntoVendorSegments(slots) {
+  const senders = slots.map((s) => emailSenderOf(s.text));
+  if (senders.filter(Boolean).length < 2) return [{ vendorHint: null, slots }];
+
+  const byKey = new Map();
+  const segments = [];
+  let current = null;
+  slots.forEach((slot, i) => {
+    if (senders[i]) {
+      const key = senders[i].toLowerCase();
+      current = byKey.get(key);
+      if (!current) {
+        current = { vendorHint: senders[i], slots: [] };
+        byKey.set(key, current);
+        segments.push(current);
+      }
+    } else if (!current) {
+      current = { vendorHint: null, slots: [] }; // pages before the first email start
+      segments.push(current);
+    }
+    current.slots.push(slot);
+  });
+  return segments;
 }
 
 // =====================================================================
@@ -606,7 +715,18 @@ function computeNetTotal(fields, discountCapPct = 0.20) {
   const cappedPct = Math.min(actualDiscountPct, discountCapPct);
   const netTotal = (subtotal - subtotal * cappedPct) + shipping;
 
+  // Discount above the cap is not honoured, so it is added back to the invoice's grand
+  // total. Everything else in the grand total (tax, fees, shipping) stays as printed.
+  const allowedDiscount = subtotal * cappedPct;
+  const excessDiscount = discount - allowedDiscount;
+  const grandTotalCapped = typeof fields.grand_total === 'number' && Number.isFinite(fields.grand_total)
+    ? fields.grand_total + excessDiscount
+    : null;
+
   return {
+    discount_allowed: round2(allowedDiscount),
+    discount_excess_added_back: round2(excessDiscount),
+    grand_total_capped: grandTotalCapped === null ? null : round2(grandTotalCapped),
     subtotal: round2(subtotal),
     shipping: round2(shipping),
     discount_taken: round2(discount),
@@ -623,6 +743,59 @@ function computeNetTotal(fields, discountCapPct = 0.20) {
 
 function round2(value) {
   return Math.round(value * 100) / 100;
+}
+
+function getItemLineAmount(item) {
+  if (typeof item.line_total === 'number' && Number.isFinite(item.line_total)) {
+    return item.line_total;
+  }
+  if (typeof item.unit_price === 'number' && Number.isFinite(item.unit_price)) {
+    const quantity = typeof item.quantity === 'number' && Number.isFinite(item.quantity)
+      ? item.quantity
+      : 1;
+    return item.unit_price * quantity;
+  }
+  return null;
+}
+
+function allocateGrandTotalAcrossItems(items, grandTotal) {
+  const amounts = items.map(getItemLineAmount);
+  if (
+    !amounts.length
+    || typeof grandTotal !== 'number'
+    || !Number.isFinite(grandTotal)
+    || amounts.some((amount) => amount === null)
+  ) {
+    return amounts;
+  }
+
+  const itemCents = amounts.map((amount) => Math.round(amount * 100));
+  const itemsSumCents = itemCents.reduce((total, cents) => total + cents, 0);
+  const targetCents = Math.round(grandTotal * 100);
+
+  // Preferred: scale every item in proportion to its value so the items add up to the
+  // target (largest-remainder rounding keeps the cents exact). Tax, shipping and the
+  // discount are therefore shared by value, not equally per item.
+  if (itemsSumCents > 0 && targetCents > 0 && itemCents.every((cents) => cents >= 0)) {
+    const exact = itemCents.map((cents) => (cents * targetCents) / itemsSumCents);
+    const floors = exact.map(Math.floor);
+    let left = targetCents - floors.reduce((total, cents) => total + cents, 0);
+    const byRemainder = exact
+      .map((value, index) => ({ index, rem: value - floors[index] }))
+      .sort((a, b) => b.rem - a.rem);
+    for (let i = 0; left > 0; i = (i + 1) % byRemainder.length, left -= 1) floors[byRemainder[i].index] += 1;
+    return floors.map((cents) => cents / 100);
+  }
+
+  // Fallback (zero or negative amounts): equal split of the difference, as before.
+  const adjustmentCents = targetCents - itemsSumCents;
+  const equalShare = Math.trunc(adjustmentCents / itemCents.length);
+  const remainder = adjustmentCents - equalShare * itemCents.length;
+
+  return itemCents.map((cents, index) => {
+    const remainderCent = index < Math.abs(remainder) ? Math.sign(remainder) : 0;
+    return (cents + equalShare + remainderCent) / 100;
+  });
 }
 
 // =====================================================================
@@ -812,18 +985,18 @@ function lineConf(words) {
 // LLM extraction (batched, with retries and automatic splitting on truncation)
 // =====================================================================
 
-const BASE_PROMPT = `Extract invoice/order details from the supplied text. The document may contain multiple orders; return one object per order. Do not guess missing values: use null. Include every purchased item. For each item return description, quantity, unit_price, line_total, and source_text. unit_price is the price of one unit; line_total only when explicitly printed as a line total. Also return order_number, order_date, currency, subtotal, shipping, discount (positive number), tax, and grand_total. Return ONLY valid JSON with this shape:
-{"vendor":string|null,"orders":[{"order_number":string|null,"order_date":string|null,"currency":string|null,"items":[{"description":string,"quantity":number|null,"unit_price":number|null,"line_total":number|null,"source_text":string}],"subtotal":number|null,"shipping":number|null,"discount":number|null,"tax":number|null,"grand_total":number|null}],"warnings":string[]}`;
+const BASE_PROMPT = `Extract invoice/order details from the supplied text. The document may contain multiple orders, and they may come from DIFFERENT vendors/stores (for example several order emails merged into one PDF). Return one object per order and put that order's own vendor/store name on it ("vendor"); never stop after the first vendor, and never attach one vendor's items or totals to another vendor's order. When the price printed beside an item's quantity (e.g. "QTY: 6 $11.88") makes the item prices add up to the printed subtotal, it is the line total: set line_total to it and unit_price to line_total divided by quantity. Do not guess missing values: use null. Include every purchased item. For each item return description, short_name, variant, quantity, unit_price, line_total, and source_text. description is the full product title as printed. short_name is the product type in 2-4 words (e.g. "Tie-Up Jumpsuit", "Wireless Earbuds", "Phone Case"): no brand, no gender or season words ("Women's", "Summer"), no marketing filler. variant is the size/color/model/capacity as printed (e.g. "Hot Pink / L", "128GB Black"), or null. source_text is the first 120 characters of the title as printed. unit_price is the price of one unit; line_total only when explicitly printed as a line total. Also return order_number, order_date, currency, subtotal, shipping, discount (positive number), tax, and grand_total. Return ONLY valid JSON with this shape:
+{"orders":[{"vendor":string|null,"order_number":string|null,"order_date":string|null,"currency":string|null,"items":[{"description":string,"short_name":string,"variant":string|null,"quantity":number|null,"unit_price":number|null,"line_total":number|null,"source_text":string}],"subtotal":number|null,"shipping":number|null,"discount":number|null,"tax":number|null,"grand_total":number|null}],"warnings":string[]}`;
 
 const SHEIN_PROMPT_NOTES = `
 This is a SHEIN "Order Details" printout. Each "=== ORDER ===" block below is exactly ONE order; return exactly one object per block, in the same order.
 - order_number is the code starting with "GS" (e.g. GSU17V30Q000BBW), shown under "Order NO."; order_date is the value under "Date".
-- Items are in the table with columns Products / Quantity / SKU / Amount / Status. The product title can wrap over several lines and ends with the variant (e.g. "Hot Pink / L"); include it in the description.
+- Items are in the table with columns Products / Quantity / SKU / Amount / Status. The product title can wrap over several lines and ends with the variant (e.g. "Hot Pink / L"). Put the whole title in description, the product type in short_name, and the trailing variant in variant.
 - The Amount column shows two prices for the item: the price charged and the struck-through original retail price. The text order of the two can be swapped (especially in OCR text), so the LOWER one is the charged price; use it as unit_price and never use the retail price.
 - Text may come from OCR: in order numbers, letters O/Q and digit 0 are easily confused, so keep the order number exactly as printed.
 - Under the table: Retail Price, Subtotal, Shipping Fee, On-Time Delivery Guarantee, Discount (coupon, shown as a negative), Sales Tax, Total. Map Total to grand_total, Sales Tax to tax, Shipping Fee to shipping ("FREE" means 0). Return the discount as a positive number.
 - currency is USD unless stated otherwise.
-- Keep source_text short (the product title as printed, max 120 characters).`;
+- Keep source_text to the product title as printed, max 120 characters.`;
 
 async function callAnthropic(prompt, { apiKey, model, signal }) {
   const maxAttempts = 5;
@@ -876,7 +1049,10 @@ async function extractBatchAdaptive(groups, llmOptions) {
   const body = llmOptions.shein
     ? groups.map((g, i) => `=== ORDER ${i + 1} (pages ${g.pageNumbers.join(', ')}) ===\n${g.text}`).join('\n\n')
     : groups.map((g) => g.text).join('\n\n');
-  const prompt = `${BASE_PROMPT}${llmOptions.shein ? `\n${SHEIN_PROMPT_NOTES}` : ''}\n\nInvoice text:\n${body}`;
+  const hintNote = llmOptions.vendorHint && !llmOptions.shein
+    ? `\nThe text below is one vendor's document, sent by "${llmOptions.vendorHint}" (taken from the email header). Use the store's brand name as vendor.`
+    : '';
+  const prompt = `${BASE_PROMPT}${llmOptions.shein ? `\n${SHEIN_PROMPT_NOTES}` : ''}${hintNote}\n\nInvoice text:\n${body}`;
 
   const result = await callAnthropic(prompt, llmOptions);
   const raw = (result.content || []).filter((part) => part.type === 'text').map((part) => part.text).join('');
@@ -897,8 +1073,7 @@ async function extractBatchAdaptive(groups, llmOptions) {
         extractBatchAdaptive(groups.slice(0, mid), llmOptions),
         extractBatchAdaptive(groups.slice(mid), llmOptions),
       ]);
-      return { orders: [...a.orders, ...b.orders], warnings: [...a.warnings, ...b.warnings] };
-    }
+      return { orders: [...a.orders, ...b.orders], warnings: [...a.warnings, ...b.warnings] };    }
     if (result.stop_reason === 'max_tokens') {
       throw new Error('Anthropic response was truncated (max_tokens) even for a single batch.');
     }
@@ -907,9 +1082,13 @@ async function extractBatchAdaptive(groups, llmOptions) {
 
   const warnings = Array.isArray(data.warnings) ? [...data.warnings] : [];
   // One group = one order for SHEIN; when counts line up, remember which pages each order came from.
+  // Vendor: the model's value wins; fall back to a top-level "vendor" (old shape), then the email-header hint.
   const orders = data.orders.map((order, i) => ({
     ...order,
-    __pages: llmOptions.shein && data.orders.length === groups.length ? groups[i].pageNumbers.join(',') : null,
+    vendor: order.vendor || data.vendor || (llmOptions.shein ? 'SHEIN' : llmOptions.vendorHint) || null,
+    __pages: llmOptions.shein && data.orders.length === groups.length
+      ? groups[i].pageNumbers.join(',')
+      : (llmOptions.pagesLabel || null),
   }));
   if (llmOptions.shein && data.orders.length !== groups.length) {
     warnings.push(`Expected ${groups.length} orders for pages ${groups[0].pageNumbers[0]}-${groups[groups.length - 1].pageNumbers.slice(-1)[0]} but got ${data.orders.length}; please review.`);
@@ -948,40 +1127,68 @@ async function processPdf(pdfPath, outputRoot, options = {}) {
 
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
-    console.log(apiKey)
     if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not set. Add it to your environment or .env file.');
 
-    const { pages: loaded, totalPages, vendor } = await loadPages(pdfPath, workdir, concurrency);
+    const { pages: loaded, totalPages, segments } = await loadPages(pdfPath, workdir, concurrency);
     const pageSources = loaded.map((p) => p.source);
+    const merged = segments.length > 1; // several vendors' documents in one PDF
 
-    // Build the units of work. SHEIN: one group per order, trimmed to the useful
-    // lines, sent in batches. Anything else: all pages in a single request (as before).
-    let batches;
-    if (vendor === 'SHEIN') {
-      const groups = groupSheinOrders(loaded);
-      batches = [];
-      for (let i = 0; i < groups.length; i += ORDERS_PER_REQUEST) {
-        batches.push(groups.slice(i, i + ORDERS_PER_REQUEST));
+    // Build the units of work, one per vendor segment. SHEIN segment: one group per
+    // order, trimmed to the useful lines, sent in batches. Anything else: all of the
+    // segment's pages in a single request. A single-vendor PDF is one segment.
+    const batches = [];
+    for (const seg of segments) {
+      if (seg.shein) {
+        const groups = groupSheinOrders(seg.pages);
+        const before = batches.length;
+        for (let i = 0; i < groups.length; i += ORDERS_PER_REQUEST) {
+          batches.push({ shein: true, vendorHint: 'SHEIN', pagesLabel: null, groups: groups.slice(i, i + ORDERS_PER_REQUEST) });
+        }
+        warnings.push(
+          `SHEIN invoice detected: sent ${seg.pages.length} of ${totalPages} pages (${groups.length} orders) to the LLM in ${batches.length - before} request(s).`
+        );
+      } else {
+        const pageNumbers = seg.pages.map((p) => p.pageNumber);
+        const text = seg.pages.map((page) =>
+          `=== PAGE ${page.pageNumber} ===\n${wordsToText(page.words)}`
+        ).join('\n\n');
+        batches.push({
+          shein: false,
+          vendorHint: seg.vendorHint,
+          pagesLabel: merged ? pageNumbers.join(',') : null,
+          groups: [{ pageNumbers, text }],
+        });
       }
+    }
+    if (merged) {
       warnings.push(
-        `SHEIN invoice detected: sent ${loaded.length} of ${totalPages} pages (${groups.length} orders) to the LLM in ${batches.length} request(s).`
+        `Merged invoice detected: ${segments.length} vendor documents (${segments.map((s) => s.vendorHint || 'unknown').join(', ')}), each extracted separately.`
       );
-    } else {
-      const text = loaded.map((page) =>
-        `=== PAGE ${page.pageNumber} ===\n${wordsToText(page.words)}`
-      ).join('\n\n');
-      batches = [[{ pageNumbers: loaded.map((p) => p.pageNumber), text }]];
     }
 
     const model = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
-    const llmOptions = { apiKey, model, signal: options.signal, shein: vendor === 'SHEIN' };
-    const batchResults = await mapLimit(batches, LLM_CONCURRENCY, (batch) => extractBatchAdaptive(batch, llmOptions));
+    const baseLlmOptions = { apiKey, model, signal: options.signal };
+    const batchResults = await mapLimit(batches, LLM_CONCURRENCY, (batch) =>
+      extractBatchAdaptive(batch.groups, {
+        ...baseLlmOptions,
+        shein: batch.shein,
+        vendorHint: batch.vendorHint,
+        pagesLabel: batch.pagesLabel,
+      })
+    );
 
     const allOrders = [];
-    for (const res of batchResults) {
+    batchResults.forEach((res, i) => {
       allOrders.push(...res.orders);
       warnings.push(...res.warnings);
-    }
+      // In a merged file a vendor that yields nothing must not vanish silently:
+      // emit an empty order so it shows up in the output flagged for review.
+      if (merged && !res.orders.length) {
+        const b = batches[i];
+        warnings.push(`No orders extracted for ${b.vendorHint || 'unknown vendor'} (pages ${b.groups[0].pageNumbers.join(',')}).`);
+        allOrders.push({ vendor: b.vendorHint || null, items: [], __pages: b.pagesLabel });
+      }
+    });
     const data = { orders: allOrders };
     const orderRows = [];
     const itemRows = [];
@@ -997,6 +1204,10 @@ async function processPdf(pdfPath, outputRoot, options = {}) {
       };
       const netTotals = computeNetTotal(fields);
       const items = Array.isArray(order.items) ? order.items : [];
+      const itemAmounts = items.map(getItemLineAmount);
+      // Item prices add up to the grand total recomputed with the discount capped (20%),
+      // falling back to the printed grand total when it can't be computed.
+      const allocatedItemPrices = allocateGrandTotalAcrossItems(items, netTotals.grand_total_capped ?? order.grand_total);
       const reviewFlags = [];
       if (order.subtotal == null) reviewFlags.push('summary_not_parsed');
       if (!order.order_number) reviewFlags.push('order_number_missing');
@@ -1005,14 +1216,7 @@ async function processPdf(pdfPath, outputRoot, options = {}) {
         reviewFlags.push('items_missing_price');
       }
 
-      const itemsSum = round2(items.reduce((sum, item) => {
-        const amount = typeof item.line_total === 'number'
-          ? item.line_total
-          : typeof item.unit_price === 'number'
-            ? item.unit_price * (typeof item.quantity === 'number' ? item.quantity : 1)
-            : 0;
-        return sum + amount;
-      }, 0));
+      const itemsSum = round2(itemAmounts.reduce((sum, amount) => sum + (amount ?? 0), 0));
 
       if (typeof order.subtotal === 'number' && items.length && Math.abs(itemsSum - order.subtotal) > 0.01) {
         reviewFlags.push('items_sum_differs_from_subtotal');
@@ -1021,6 +1225,7 @@ async function processPdf(pdfPath, outputRoot, options = {}) {
       orderRows.push({
         order_index: index,
         source_file: path.basename(pdfPath),
+        vendor: order.vendor || null,
         order_number: order.order_number || null,
         order_date: order.order_date || null,
         pages: order.__pages || 'all',
@@ -1030,28 +1235,25 @@ async function processPdf(pdfPath, outputRoot, options = {}) {
         review_flags: reviewFlags.join('; '),
       });
 
-      items.forEach((item) => {
-        const price = typeof item.line_total === 'number'
-          ? item.line_total
-          : typeof item.unit_price === 'number'
-            ? item.unit_price
-            : null;
+      items.forEach((item, itemIndex) => {
+        const price = allocatedItemPrices[itemIndex];
         itemRows.push({
           order_index: index,
           source_file: path.basename(pdfPath),
+          vendor: order.vendor || null,
           order_number: order.order_number || null,
-          item_description: item.description || '',
+          item_description: pickDescription(item),
           item_price: price,
           item_quantity: item.quantity ?? null,
           item_unit_price: item.unit_price ?? null,
           item_line_total: item.line_total ?? null,
-          item_source_text: item.source_text || '',
+          item_source_text: hasRealText(item.source_text) ? item.source_text : (item.description || ''),
           item_incomplete: price === null,
         });
       });
     });
 
-    return { orderRows, itemRows, warnings, pageSources, totalPages, pagesSent: loaded.length, vendor };
+    return { orderRows, itemRows, warnings, pageSources, totalPages, pagesSent: loaded.length, merged };
   } finally {
     if (!keepImages) {
       await fsp.rm(workdir, { recursive: true, force: true }).catch(() => {});
