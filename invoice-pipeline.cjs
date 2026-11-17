@@ -985,8 +985,8 @@ function lineConf(words) {
 // LLM extraction (batched, with retries and automatic splitting on truncation)
 // =====================================================================
 
-const BASE_PROMPT = `Extract invoice/order details from the supplied text. The document may contain multiple orders, and they may come from DIFFERENT vendors/stores (for example several order emails merged into one PDF). Return one object per order and put that order's own vendor/store name on it ("vendor"); never stop after the first vendor, and never attach one vendor's items or totals to another vendor's order. When the price printed beside an item's quantity (e.g. "QTY: 6 $11.88") makes the item prices add up to the printed subtotal, it is the line total: set line_total to it and unit_price to line_total divided by quantity. Do not guess missing values: use null. Include every purchased item. For each item return description, short_name, variant, quantity, unit_price, line_total, and source_text. description is the full product title as printed. short_name is the product type in 2-4 words (e.g. "Tie-Up Jumpsuit", "Wireless Earbuds", "Phone Case"): no brand, no gender or season words ("Women's", "Summer"), no marketing filler. variant is the size/color/model/capacity as printed (e.g. "Hot Pink / L", "128GB Black"), or null. source_text is the first 120 characters of the title as printed. unit_price is the price of one unit; line_total only when explicitly printed as a line total. Also return order_number, order_date, currency, subtotal, shipping, discount (positive number), tax, and grand_total. Return ONLY valid JSON with this shape:
-{"orders":[{"vendor":string|null,"order_number":string|null,"order_date":string|null,"currency":string|null,"items":[{"description":string,"short_name":string,"variant":string|null,"quantity":number|null,"unit_price":number|null,"line_total":number|null,"source_text":string}],"subtotal":number|null,"shipping":number|null,"discount":number|null,"tax":number|null,"grand_total":number|null}],"warnings":string[]}`;
+const BASE_PROMPT = `Extract invoice/order details from the supplied text. The document may contain multiple orders, and they may come from DIFFERENT vendors/stores (for example several order emails merged into one PDF). Return one object per order and put that order's own vendor/store name on it ("vendor"); never stop after the first vendor, and never attach one vendor's items or totals to another vendor's order. When the price printed beside an item's quantity (e.g. "QTY: 6 $11.88") makes the item prices add up to the printed subtotal, it is the line total: set line_total to it and unit_price to null. Every number in the JSON must be a plain literal, never an arithmetic expression. Do not guess missing values: use null. Include every purchased item. For each item return description, short_name, variant, quantity, unit_price, line_total, and source_text. description is the full product title as printed. short_name is the product type in 2-4 words (e.g. "Tie-Up Jumpsuit", "Wireless Earbuds", "Phone Case"): no brand, no gender or season words ("Women's", "Summer"), no marketing filler. variant is the size/color/model/capacity as printed (e.g. "Hot Pink / L", "128GB Black"), or null. source_text is the first 120 characters of the title as printed. unit_price is the price of one unit BEFORE any per-item discount or promo (unless the instructions below say otherwise): for "Item Price $4.99" with "Promo -$2.00" use unit_price 4.99, not the reduced 2.99. item_discount is the discount or promo applied to that item line, as a positive number (2.00 in that example), or null when the item has none. line_total only when explicitly printed as a line total. Also return order_number, order_date, currency, subtotal, shipping, discount (positive number), tax (if tax is only printed per item, return their sum), and grand_total. Leave subtotal and discount null when they are not printed; do not calculate them. warnings: at most 3 short plain strings (under 150 characters each) and only for real problems; never use double quote characters inside a warning, and keep them on one line. Return ONLY valid JSON with this shape:
+{"orders":[{"vendor":string|null,"order_number":string|null,"order_date":string|null,"currency":string|null,"items":[{"description":string,"short_name":string,"variant":string|null,"quantity":number|null,"unit_price":number|null,"item_discount":number|null,"line_total":number|null,"source_text":string}],"subtotal":number|null,"shipping":number|null,"discount":number|null,"tax":number|null,"grand_total":number|null}],"warnings":string[]}`;
 
 const SHEIN_PROMPT_NOTES = `
 This is a SHEIN "Order Details" printout. Each "=== ORDER ===" block below is exactly ONE order; return exactly one object per block, in the same order.
@@ -1031,16 +1031,31 @@ async function callAnthropic(prompt, { apiKey, model, signal }) {
 }
 
 function parseModelJson(raw) {
-  let cleaned = raw.replace(/^```json\s*/i, '').replace(/\s*```$/, '').trim();
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    // Tolerate stray prose around the JSON object.
-    const start = cleaned.indexOf('{');
-    const end = cleaned.lastIndexOf('}');
-    if (start !== -1 && end > start) cleaned = cleaned.slice(start, end + 1);
-    return JSON.parse(cleaned);
+  const cleaned = raw.replace(/^```json\s*/i, '').replace(/\s*```$/, '').trim();
+  const start = cleaned.indexOf('{');
+  const end = cleaned.lastIndexOf('}');
+
+  const attempts = [cleaned];
+  // Tolerate stray prose around the JSON object.
+  if (start !== -1 && end > start) attempts.push(cleaned.slice(start, end + 1));
+
+  // "warnings" is the last, optional field and free text, so it is what usually breaks the JSON
+  // (unescaped quotes, raw newlines, a cut-off string). If it is malformed, drop it and keep the orders.
+  if (start !== -1) {
+    let cut = -1;
+    for (const m of cleaned.matchAll(/,\s*"warnings"\s*:/g)) cut = m.index;
+    if (cut > start) attempts.push(`${cleaned.slice(start, cut)}}`);
   }
+
+  let lastError;
+  for (const text of attempts) {
+    try {
+      return JSON.parse(text);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError;
 }
 
 // groups: [{ pageNumbers, text }]. Returns { orders, warnings }.
@@ -1052,21 +1067,31 @@ async function extractBatchAdaptive(groups, llmOptions) {
   const hintNote = llmOptions.vendorHint && !llmOptions.shein
     ? `\nThe text below is one vendor's document, sent by "${llmOptions.vendorHint}" (taken from the email header). Use the store's brand name as vendor.`
     : '';
-  const prompt = `${BASE_PROMPT}${llmOptions.shein ? `\n${SHEIN_PROMPT_NOTES}` : ''}${hintNote}\n\nInvoice text:\n${body}`;
+  const retryNote = llmOptions.retried
+    ? '\nIMPORTANT: your previous answer was not valid JSON. Answer with strictly valid JSON only, escape any double quotes inside strings, and use an empty warnings array unless something is really wrong.'
+    : '';
+  const prompt = `${BASE_PROMPT}${llmOptions.shein ? `\n${SHEIN_PROMPT_NOTES}` : ''}${hintNote}${retryNote}\n\nInvoice text:\n${body}`;
 
   const result = await callAnthropic(prompt, llmOptions);
+  // Which model really answered and how many tokens it used (includes cache_* fields if any).
+  console.log('[invoice] model:', result.model, 'usage:', JSON.stringify(result.usage));
   const raw = (result.content || []).filter((part) => part.type === 'text').map((part) => part.text).join('');
 
   let data = null;
   if (result.stop_reason !== 'max_tokens') {
     try {
       data = parseModelJson(raw);
-    } catch {
+    } catch (err) {
+      console.error('[invoice] JSON parse failed:', err.message, '\n--- raw model output ---\n', raw, '\n--- end ---');
       data = null;
     }
   }
 
   if (!data || !Array.isArray(data.orders)) {
+    // One more try for a single group: the answer is not deterministic and usually comes back valid.
+    if (groups.length === 1 && !llmOptions.retried && result.stop_reason !== 'max_tokens') {
+      return extractBatchAdaptive(groups, { ...llmOptions, retried: true });
+    }
     if (groups.length > 1) {
       const mid = Math.ceil(groups.length / 2);
       const [a, b] = await Promise.all([
@@ -1193,23 +1218,43 @@ async function processPdf(pdfPath, outputRoot, options = {}) {
     const orderRows = [];
     const itemRows = [];
 
+    const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+
     data.orders.forEach((order, index) => {
+      const items = Array.isArray(order.items) ? order.items : [];
+      const itemAmounts = items.map(getItemLineAmount);
+
+      // Some invoices print no Subtotal / Discount lines, only per-item "Item Price" + "Promo" and an
+      // order total. Derive both from the items so the discount cap can still be applied.
+      let subtotal = order.subtotal;
+      let discount = order.discount;
+      let totalsDerived = false;
+      if (!isNum(subtotal) && items.length && itemAmounts.every((amount) => amount !== null)) {
+        subtotal = round2(itemAmounts.reduce((sum, amount) => sum + amount, 0));
+        totalsDerived = true;
+      }
+      if (isNum(subtotal) && !isNum(discount)) {
+        const itemDiscounts = round2(items.reduce((sum, item) => sum + (isNum(item.item_discount) ? Math.abs(item.item_discount) : 0), 0));
+        if (itemDiscounts > 0) {
+          discount = itemDiscounts;
+          totalsDerived = true;
+        }
+      }
+
       const fields = {
-        subtotal: order.subtotal,
+        subtotal,
         shipping: order.shipping,
-        discount: order.discount,
+        discount,
         tax: order.tax,
         grand_total: order.grand_total,
         currency: order.currency,
       };
       const netTotals = computeNetTotal(fields);
-      const items = Array.isArray(order.items) ? order.items : [];
-      const itemAmounts = items.map(getItemLineAmount);
       // Item prices add up to the grand total recomputed with the discount capped (20%),
       // falling back to the printed grand total when it can't be computed.
       const allocatedItemPrices = allocateGrandTotalAcrossItems(items, netTotals.grand_total_capped ?? order.grand_total);
       const reviewFlags = [];
-      if (order.subtotal == null) reviewFlags.push('summary_not_parsed');
+      if (!isNum(subtotal)) reviewFlags.push('summary_not_parsed');
       if (!order.order_number) reviewFlags.push('order_number_missing');
       if (!items.length) reviewFlags.push('no_items_found');
       if (items.some((item) => item.unit_price == null && item.line_total == null)) {
@@ -1218,7 +1263,7 @@ async function processPdf(pdfPath, outputRoot, options = {}) {
 
       const itemsSum = round2(itemAmounts.reduce((sum, amount) => sum + (amount ?? 0), 0));
 
-      if (typeof order.subtotal === 'number' && items.length && Math.abs(itemsSum - order.subtotal) > 0.01) {
+      if (isNum(subtotal) && items.length && Math.abs(itemsSum - subtotal) > 0.01) {
         reviewFlags.push('items_sum_differs_from_subtotal');
       }
 
@@ -1230,6 +1275,7 @@ async function processPdf(pdfPath, outputRoot, options = {}) {
         order_date: order.order_date || null,
         pages: order.__pages || 'all',
         ...netTotals,
+        totals_derived_from_items: totalsDerived,
         items_sum: itemsSum,
         needs_review: reviewFlags.length > 0,
         review_flags: reviewFlags.join('; '),

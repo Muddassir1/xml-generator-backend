@@ -1214,5 +1214,6 @@ app.post('/clients/:clientId/invoices', invoiceUpload.single('file'), async (req
 // Start the Server
 // ----------------------------------------------------------------------
 app.listen(port, () => {
+  console.log('ANTHROPIC_MODEL =', process.env.ANTHROPIC_MODEL);
   console.log(`Backend server is running on http://localhost:${port}`);
 });
