@@ -37,7 +37,7 @@ function loadEnvFile(file) {
     const key = line.slice(0, eq).trim();
     let value = line.slice(eq + 1).trim();
     if ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))) {
+      (value.startsWith("'") && value.endsWith("'"))) {
       value = value.slice(1, -1);
     }
     if (process.env[key] === undefined) process.env[key] = value;
@@ -57,6 +57,7 @@ const ORDERS_PER_REQUEST = 15;
 const LLM_CONCURRENCY = 2;
 const MAX_OUTPUT_TOKENS = 16384;
 const PT_TO_PX = DPI / 72; // pdftotext reports PDF points (1/72 inch)
+const USD_PER_KYD = 1.2;
 
 const PDF_TO_IMAGE_COMMAND = resolveCommand('pdftoppm', [
   'C:\\Program Files\\poppler-26.09.0\\Library\\bin\\pdftoppm.exe',
@@ -72,6 +73,14 @@ const PDF_TO_TEXT_COMMAND = resolveOptionalCommand('pdftotext', [
 
 const AMOUNT_RE_G = /-?(?:USD|KYD)?\s?-?\d[\d,]*\.\d{2}/g;
 const ORDER_NUM_RE = /Order\s*#\s*([\d-]{10,})/i;
+
+// Amazon invoices list third-party sellers under "Sold by"; the vendor is always Amazon.
+const AMAZON_VENDOR = 'Amazon';
+const AMAZON_ORDER_RE = /^\d{3}-\d{7}-\d{7}$/;
+function isAmazonDocument(text, vendorHint) {
+  if (vendorHint && /amazon/i.test(vendorHint)) return true;
+  return /Amazon\.com,?\s*Inc/i.test(text) || /\bOrder\s*#\s*\d{3}-\d{7}-\d{7}\b/i.test(text);
+}
 
 // Set to true to print per-order cutoff diagnostics.
 const DEBUG_ITEMS = false;
@@ -147,7 +156,7 @@ async function mapLimit(items, limit, fn) {
   const results = new Array(items.length);
   let next = 0;
   const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    for (;;) {
+    for (; ;) {
       const i = next;
       next += 1;
       if (i >= items.length) return;
@@ -182,7 +191,7 @@ function trimToWords(text, max) {
 function pickDescription(item) {
   const name = hasRealText(item.short_name) ? squash(item.short_name)
     : hasRealText(item.description) ? squash(item.description)
-    : squash(item.source_text);
+      : squash(item.source_text);
   let variant = hasRealText(item.variant) ? trimToWords(item.variant, 22) : '';
 
   if (!variant) return trimToWords(name, MAX_DESC_LEN);
@@ -706,27 +715,49 @@ function getOrderNumber(text) {
 
 function computeNetTotal(fields, discountCapPct = 0.20) {
   const subtotal = fields.subtotal;
-  if (subtotal === undefined) return {};
+  // Without a usable subtotal there is no base to cap against.
+  if (typeof subtotal !== 'number' || !Number.isFinite(subtotal)) return {};
   const shipping = fields.shipping || 0;
   const discount = Math.abs(fields.discount || 0);
   const fxFee = fields.fx_guarantee_fee || 0;
+  const tax = fields.tax || 0;
   const rewardPts = Math.abs(fields.reward_points || 0);
-  const actualDiscountPct = subtotal ? discount / subtotal : 0;
+  const grandTotal = typeof fields.grand_total === 'number' && Number.isFinite(fields.grand_total)
+    ? fields.grand_total
+    : null;
+
+  // The discount percentage must be measured against the price BEFORE the discount.
+  // Some invoices (e.g. Temu: "Item(s) total 18.22, Item(s) discount -13.42, Subtotal 4.80")
+  // print a Subtotal that is already net of the discount. The arithmetic tells them apart:
+  //   subtotal before discount: grand total = subtotal - discount + shipping + tax (+ fees)
+  //   subtotal already net:     grand total = subtotal + shipping + tax (+ fees)
+  let baseSubtotal = subtotal;
+  let subtotalIsNet = false;
+  if (grandTotal !== null && discount > 0) {
+    const ifBeforeDiscount = subtotal - discount + shipping + tax + fxFee;
+    const ifNetOfDiscount = subtotal + shipping + tax + fxFee;
+    if (Math.abs(grandTotal - ifNetOfDiscount) <= 0.02 && Math.abs(grandTotal - ifBeforeDiscount) > 0.02) {
+      baseSubtotal = subtotal + discount;
+      subtotalIsNet = true;
+    }
+  }
+
+  const actualDiscountPct = baseSubtotal ? discount / baseSubtotal : 0;
   const cappedPct = Math.min(actualDiscountPct, discountCapPct);
-  const netTotal = (subtotal - subtotal * cappedPct) + shipping;
+  const netTotal = (baseSubtotal - baseSubtotal * cappedPct) + shipping;
 
   // Discount above the cap is not honoured, so it is added back to the invoice's grand
   // total. Everything else in the grand total (tax, fees, shipping) stays as printed.
-  const allowedDiscount = subtotal * cappedPct;
+  const allowedDiscount = baseSubtotal * cappedPct;
   const excessDiscount = discount - allowedDiscount;
-  const grandTotalCapped = typeof fields.grand_total === 'number' && Number.isFinite(fields.grand_total)
-    ? fields.grand_total + excessDiscount
-    : null;
+  const grandTotalCapped = grandTotal !== null ? grandTotal + excessDiscount : null;
 
   return {
     discount_allowed: round2(allowedDiscount),
     discount_excess_added_back: round2(excessDiscount),
     grand_total_capped: grandTotalCapped === null ? null : round2(grandTotalCapped),
+    subtotal_before_discount: round2(baseSubtotal),
+    subtotal_is_net_of_discount: subtotalIsNet,
     subtotal: round2(subtotal),
     shipping: round2(shipping),
     discount_taken: round2(discount),
@@ -736,13 +767,42 @@ function computeNetTotal(fields, discountCapPct = 0.20) {
     reward_points_redeemed_flag: rewardPts > 0,
     net_total_for_duty: round2(netTotal),
     currency: fields.currency || 'USD',
-    tax_excluded: round2(fields.tax || 0),
+    // tax_excluded: round2(fields.tax || 0),
+    tax_excluded: null,
     grand_total_on_invoice: fields.grand_total ?? null,
   };
 }
 
 function round2(value) {
   return Math.round(value * 100) / 100;
+}
+
+function convertOrderToUsd(order) {
+  const currency = String(order.currency || 'USD').trim().toUpperCase();
+  const rate = currency === 'KYD' ? USD_PER_KYD : currency === 'USD' ? 1 : null;
+  if (rate === null) {
+    throw new Error(`Unsupported invoice currency "${currency}". Cannot convert invoice prices to USD.`);
+  }
+
+  const convertAmount = (amount) =>
+    typeof amount === 'number' && Number.isFinite(amount) ? round2(amount * rate) : amount;
+  const convertFields = (record, fields) =>
+    fields.reduce((converted, field) => {
+      converted[field] = convertAmount(record[field]);
+      return converted;
+    }, {});
+
+  return {
+    ...order,
+    ...convertFields(order, ['subtotal', 'shipping', 'discount', 'tax', 'grand_total']),
+    currency: 'USD',
+    items: Array.isArray(order.items)
+      ? order.items.map((item) => ({
+        ...item,
+        ...convertFields(item, ['unit_price', 'line_total', 'item_discount', 'item_tax', 'item_total_with_tax']),
+      }))
+      : order.items,
+  };
 }
 
 function getItemLineAmount(item) {
@@ -797,6 +857,66 @@ function allocateGrandTotalAcrossItems(items, grandTotal) {
     return (cents + equalShare + remainderCent) / 100;
   });
 }
+
+// Makes every item amount pre-tax, whatever the invoice layout. Only acts when the row
+// has its own tax figure; rows with just a price are left alone.
+function normalizeItemTax(item) {
+  const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+  const tax = isNum(item.item_tax) ? Math.abs(item.item_tax) : 0;
+  if (!tax) return item;
+
+  const qty = isNum(item.quantity) ? item.quantity : 1;
+  const withTax = isNum(item.item_total_with_tax) ? item.item_total_with_tax : null;
+  const preTax = isNum(item.unit_price) ? round2(item.unit_price * qty) : null;
+  const candidate = isNum(item.line_total) ? item.line_total : preTax; // what the code would use as the line amount
+  const next = { ...item };
+
+  if (candidate !== null) {
+    const inclusive = withTax !== null
+      ? Math.abs(candidate - withTax) <= 0.02 // equals the row's with-tax total, so it includes tax
+      : preTax !== null && isNum(item.line_total) && Math.abs(item.line_total - (preTax + tax)) <= 0.02;
+    if (inclusive) next.line_total = round2(candidate - tax);
+  } else if (withTax !== null) {
+    next.line_total = round2(withTax - tax); // only the with-tax total was found
+  }
+  return next;
+}
+
+// Items with no price of their own (price only appears in the order summary) get their
+// share of the printed Subtotal, which already excludes tax. Whatever the priced items
+// don't account for is split among the unpriced ones, weighted by quantity.
+function fillMissingItemAmounts(items, subtotal) {
+  const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+  if (!isNum(subtotal) || !items.length) return items;
+
+  const missing = [];
+  let knownSum = 0;
+  items.forEach((item, i) => {
+    const amount = getItemLineAmount(item);
+    if (amount === null) missing.push(i);
+    else knownSum += amount;
+  });
+  if (!missing.length) return items;
+
+  const remainder = round2(subtotal - knownSum);
+  if (remainder <= 0) return items; // subtotal doesn't leave anything to assign
+
+  const qtyOf = (item) => (isNum(item.quantity) && item.quantity > 0 ? item.quantity : 1);
+  const totalQty = missing.reduce((sum, i) => sum + qtyOf(items[i]), 0);
+  const out = items.map((item) => ({ ...item }));
+  let left = remainder;
+  missing.forEach((idx, k) => {
+    const share = k === missing.length - 1
+      ? round2(left)
+      : round2((remainder * qtyOf(items[idx])) / totalQty);
+    left = round2(left - share);
+    out[idx].line_total = share;
+    out[idx].unit_price = null;
+    out[idx].__from_subtotal = true;
+  });
+  return out;
+}
+
 
 // =====================================================================
 // Item-line extraction (title -> "Sold by:" -> boilerplate -> price)
@@ -985,8 +1105,8 @@ function lineConf(words) {
 // LLM extraction (batched, with retries and automatic splitting on truncation)
 // =====================================================================
 
-const BASE_PROMPT = `Extract invoice/order details from the supplied text. The document may contain multiple orders, and they may come from DIFFERENT vendors/stores (for example several order emails merged into one PDF). Return one object per order and put that order's own vendor/store name on it ("vendor"); never stop after the first vendor, and never attach one vendor's items or totals to another vendor's order. When the price printed beside an item's quantity (e.g. "QTY: 6 $11.88") makes the item prices add up to the printed subtotal, it is the line total: set line_total to it and unit_price to null. Every number in the JSON must be a plain literal, never an arithmetic expression. Do not guess missing values: use null. Include every purchased item. For each item return description, short_name, variant, quantity, unit_price, line_total, and source_text. description is the full product title as printed. short_name is the product type in 2-4 words (e.g. "Tie-Up Jumpsuit", "Wireless Earbuds", "Phone Case"): no brand, no gender or season words ("Women's", "Summer"), no marketing filler. variant is the size/color/model/capacity as printed (e.g. "Hot Pink / L", "128GB Black"), or null. source_text is the first 120 characters of the title as printed. unit_price is the price of one unit BEFORE any per-item discount or promo (unless the instructions below say otherwise): for "Item Price $4.99" with "Promo -$2.00" use unit_price 4.99, not the reduced 2.99. item_discount is the discount or promo applied to that item line, as a positive number (2.00 in that example), or null when the item has none. line_total only when explicitly printed as a line total. Also return order_number, order_date, currency, subtotal, shipping, discount (positive number), tax (if tax is only printed per item, return their sum), and grand_total. Leave subtotal and discount null when they are not printed; do not calculate them. warnings: at most 3 short plain strings (under 150 characters each) and only for real problems; never use double quote characters inside a warning, and keep them on one line. Return ONLY valid JSON with this shape:
-{"orders":[{"vendor":string|null,"order_number":string|null,"order_date":string|null,"currency":string|null,"items":[{"description":string,"short_name":string,"variant":string|null,"quantity":number|null,"unit_price":number|null,"item_discount":number|null,"line_total":number|null,"source_text":string}],"subtotal":number|null,"shipping":number|null,"discount":number|null,"tax":number|null,"grand_total":number|null}],"warnings":string[]}`;
+const BASE_PROMPT = `Extract invoice/order details from the supplied text. The document may contain multiple orders, and they may come from DIFFERENT vendors/stores (for example several order emails merged into one PDF). Return one object per order and put that order's own vendor/store name on it ("vendor"); never stop after the first vendor, and never attach one vendor's items or totals to another vendor's order. When the price printed beside an item's quantity (e.g. "QTY: 6 $11.88") makes the item prices add up to the printed subtotal, it is the line total: set line_total to it and unit_price to null. Every number in the JSON must be a plain literal, never an arithmetic expression. Do not guess missing values: use null. Include every purchased item. For each item return description, short_name, variant, quantity, unit_price, line_total, and source_text. description is the full product title as printed. short_name is the product type in 2-4 words (e.g. "Tie-Up Jumpsuit", "Wireless Earbuds", "Phone Case"): no brand, no gender or season words ("Women's", "Summer"), no marketing filler. variant is the size/color/model/capacity as printed (e.g. "Hot Pink / L", "128GB Black"), or null. source_text is the first 120 characters of the title as printed. unit_price is the price of one unit BEFORE any per-item discount or promo (unless the instructions below say otherwise): for "Item Price $4.99" with "Promo -$2.00" use unit_price 4.99, not the reduced 2.99. item_discount is the discount or promo applied to that item line, as a positive number (2.00 in that example), or null when the item has none. line_total only when explicitly printed as a line total, and it must be BEFORE tax. unit_price must also be BEFORE tax. Some invoices print tax on each item row (for example columns Unit Price / Qty / Subtotal / Tax / Total): in that case item_tax is that row's tax as a positive number and item_total_with_tax is the row's final amount that includes tax. Invoices that only show a price next to the item have no per-row tax: use the price as unit_price or line_total as described above and leave item_tax and item_total_with_tax null. Never put a tax-inclusive amount in unit_price or line_total . Also return order_number, order_date, currency, subtotal, shipping, discount (positive number), tax (if tax is only printed per item, return their sum), and grand_total. Leave subtotal and discount null when they are not printed; do not calculate them. warnings: at most 3 short plain strings (under 150 characters each) and only for real problems; never use double quote characters inside a warning, and keep them on one line. Return ONLY valid JSON with this shape:
+{"orders":[{"vendor":string|null,"order_number":string|null,"order_date":string|null,"currency":string|null,"items":[{"description":string,"short_name":string,"variant":string|null,"quantity":number|null,"unit_price":number|null,"item_discount":number|null,"line_total":number|null,"item_tax":number|null,"item_total_with_tax":number|null,"source_text":string}],"subtotal":number|null,"shipping":number|null,"discount":number|null,"tax":number|null,"grand_total":number|null}],"warnings":string[]}`;
 
 const SHEIN_PROMPT_NOTES = `
 This is a SHEIN "Order Details" printout. Each "=== ORDER ===" block below is exactly ONE order; return exactly one object per block, in the same order.
@@ -1070,7 +1190,10 @@ async function extractBatchAdaptive(groups, llmOptions) {
   const retryNote = llmOptions.retried
     ? '\nIMPORTANT: your previous answer was not valid JSON. Answer with strictly valid JSON only, escape any double quotes inside strings, and use an empty warnings array unless something is really wrong.'
     : '';
-  const prompt = `${BASE_PROMPT}${llmOptions.shein ? `\n${SHEIN_PROMPT_NOTES}` : ''}${hintNote}${retryNote}\n\nInvoice text:\n${body}`;
+  const amazonNote = llmOptions.amazon
+    ? `\nThis is an Amazon order. Set vendor to "${AMAZON_VENDOR}" for every order. The name after "Sold by" is a third-party seller, never the vendor.`
+    : '';
+  const prompt = `${BASE_PROMPT}${llmOptions.shein ? `\n${SHEIN_PROMPT_NOTES}` : ''}${hintNote}${amazonNote}${retryNote}\n\nInvoice text:\n${body}`;
 
   const result = await callAnthropic(prompt, llmOptions);
   // Which model really answered and how many tokens it used (includes cache_* fields if any).
@@ -1098,7 +1221,8 @@ async function extractBatchAdaptive(groups, llmOptions) {
         extractBatchAdaptive(groups.slice(0, mid), llmOptions),
         extractBatchAdaptive(groups.slice(mid), llmOptions),
       ]);
-      return { orders: [...a.orders, ...b.orders], warnings: [...a.warnings, ...b.warnings] };    }
+      return { orders: [...a.orders, ...b.orders], warnings: [...a.warnings, ...b.warnings] };
+    }
     if (result.stop_reason === 'max_tokens') {
       throw new Error('Anthropic response was truncated (max_tokens) even for a single batch.');
     }
@@ -1110,7 +1234,9 @@ async function extractBatchAdaptive(groups, llmOptions) {
   // Vendor: the model's value wins; fall back to a top-level "vendor" (old shape), then the email-header hint.
   const orders = data.orders.map((order, i) => ({
     ...order,
-    vendor: order.vendor || data.vendor || (llmOptions.shein ? 'SHEIN' : llmOptions.vendorHint) || null,
+    vendor: llmOptions.amazon && (!order.order_number || AMAZON_ORDER_RE.test(String(order.order_number).trim()))
+      ? AMAZON_VENDOR
+      : (order.vendor || data.vendor || (llmOptions.shein ? 'SHEIN' : llmOptions.vendorHint) || null),
     __pages: llmOptions.shein && data.orders.length === groups.length
       ? groups[i].pageNumbers.join(',')
       : (llmOptions.pagesLabel || null),
@@ -1181,6 +1307,7 @@ async function processPdf(pdfPath, outputRoot, options = {}) {
           shein: false,
           vendorHint: seg.vendorHint,
           pagesLabel: merged ? pageNumbers.join(',') : null,
+          amazon: isAmazonDocument(text, seg.vendorHint),
           groups: [{ pageNumbers, text }],
         });
       }
@@ -1199,6 +1326,7 @@ async function processPdf(pdfPath, outputRoot, options = {}) {
         shein: batch.shein,
         vendorHint: batch.vendorHint,
         pagesLabel: batch.pagesLabel,
+        amazon: batch.amazon,
       })
     );
 
@@ -1214,14 +1342,17 @@ async function processPdf(pdfPath, outputRoot, options = {}) {
         allOrders.push({ vendor: b.vendorHint || null, items: [], __pages: b.pagesLabel });
       }
     });
-    const data = { orders: allOrders };
+    const data = { orders: allOrders.map(convertOrderToUsd) };
     const orderRows = [];
     const itemRows = [];
 
     const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 
     data.orders.forEach((order, index) => {
-      const items = Array.isArray(order.items) ? order.items : [];
+      const items = fillMissingItemAmounts(
+        (Array.isArray(order.items) ? order.items : []).map(normalizeItemTax),
+        order.subtotal
+      );
       const itemAmounts = items.map(getItemLineAmount);
 
       // Some invoices print no Subtotal / Discount lines, only per-item "Item Price" + "Promo" and an
@@ -1232,6 +1363,18 @@ async function processPdf(pdfPath, outputRoot, options = {}) {
       if (!isNum(subtotal) && items.length && itemAmounts.every((amount) => amount !== null)) {
         subtotal = round2(itemAmounts.reduce((sum, amount) => sum + amount, 0));
         totalsDerived = true;
+        // Safety net: if the item amounts add up to the grand total WITHOUT tax added on top,
+        // they still contain tax, so take the order tax back out.
+        const orderTax = isNum(order.tax) ? Math.abs(order.tax) : 0;
+        if (orderTax > 0 && isNum(order.grand_total)) {
+          const disc = isNum(order.discount) ? Math.abs(order.discount) : 0;
+          const ship = isNum(order.shipping) ? order.shipping : 0;
+          const ifInclusive = subtotal - disc + ship;
+          const ifPreTax = ifInclusive + orderTax;
+          if (Math.abs(order.grand_total - ifInclusive) <= 0.02 && Math.abs(order.grand_total - ifPreTax) > 0.02) {
+            subtotal = round2(subtotal - orderTax);
+          }
+        }
       }
       if (isNum(subtotal) && !isNum(discount)) {
         const itemDiscounts = round2(items.reduce((sum, item) => sum + (isNum(item.item_discount) ? Math.abs(item.item_discount) : 0), 0));
@@ -1252,7 +1395,7 @@ async function processPdf(pdfPath, outputRoot, options = {}) {
       const netTotals = computeNetTotal(fields);
       // Item prices add up to the grand total recomputed with the discount capped (20%),
       // falling back to the printed grand total when it can't be computed.
-      const allocatedItemPrices = allocateGrandTotalAcrossItems(items, netTotals.grand_total_capped ?? order.grand_total);
+      const allocatedItemPrices = allocateGrandTotalAcrossItems(items, netTotals.net_total_for_duty ?? null);
       const reviewFlags = [];
       if (!isNum(subtotal)) reviewFlags.push('summary_not_parsed');
       if (!order.order_number) reviewFlags.push('order_number_missing');
@@ -1302,7 +1445,7 @@ async function processPdf(pdfPath, outputRoot, options = {}) {
     return { orderRows, itemRows, warnings, pageSources, totalPages, pagesSent: loaded.length, merged };
   } finally {
     if (!keepImages) {
-      await fsp.rm(workdir, { recursive: true, force: true }).catch(() => {});
+      await fsp.rm(workdir, { recursive: true, force: true }).catch(() => { });
     }
   }
 }

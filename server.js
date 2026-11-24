@@ -1189,6 +1189,7 @@ app.post('/clients/:clientId/invoices', invoiceUpload.single('file'), async (req
       if (hasFlaggedItem && !flags.includes('items_need_review')) flags.push('items_need_review');
       return {
         ...order,
+        currency: 'USD',
         needs_review: order.needs_review || hasFlaggedItem,
         review_flags: flags.join('; '),
         items,
