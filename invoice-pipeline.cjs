@@ -1131,6 +1131,7 @@ async function callAnthropic(prompt, { apiKey, model, signal }) {
       body: JSON.stringify({
         model,
         max_tokens: MAX_OUTPUT_TOKENS,
+        thinking: { type: 'disabled' },
         messages: [{ role: 'user', content: prompt }],
       }),
       signal,
