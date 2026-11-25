@@ -57,7 +57,7 @@ const ORDERS_PER_REQUEST = 15;
 const LLM_CONCURRENCY = 2;
 const MAX_OUTPUT_TOKENS = 16384;
 const PT_TO_PX = DPI / 72; // pdftotext reports PDF points (1/72 inch)
-const USD_PER_KYD = 1.2;
+const KYD_PER_USD = 0.833;
 
 const PDF_TO_IMAGE_COMMAND = resolveCommand('pdftoppm', [
   'C:\\Program Files\\poppler-26.09.0\\Library\\bin\\pdftoppm.exe',
@@ -779,7 +779,7 @@ function round2(value) {
 
 function convertOrderToUsd(order) {
   const currency = String(order.currency || 'USD').trim().toUpperCase();
-  const rate = currency === 'KYD' ? USD_PER_KYD : currency === 'USD' ? 1 : null;
+  const rate = currency === 'KYD' ? 1 / KYD_PER_USD : currency === 'USD' ? 1 : null;
   if (rate === null) {
     throw new Error(`Unsupported invoice currency "${currency}". Cannot convert invoice prices to USD.`);
   }
